@@ -15,9 +15,8 @@ COPY requirements.txt .
 # Install Python packages
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
+# Copy application (do NOT bake .env into the image - pass secrets at runtime)
 COPY app.py .
-COPY .env .
 
 # Expose port
 EXPOSE 5000

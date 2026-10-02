@@ -90,16 +90,21 @@ def init_db():
 def load_models():
     """Load Mistral and Falcon models"""
     print("Loading models...")
-    
+
+    hf_token = os.getenv("HUGGINGFACE_TOKEN")
+    if not hf_token:
+        print("WARNING: HUGGINGFACE_TOKEN is not set - gated models (Mistral) may fail to download")
+
     MODEL_A = "mistralai/Mistral-7B-Instruct-v0.1"
     MODEL_B = "tiiuae/falcon-7b-instruct"
-    
+
     def safe_load(model_name):
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map="auto",
             torch_dtype=torch.float16,
+            token=hf_token,
         )
         gen = pipeline(
             "text-generation",
@@ -402,6 +407,7 @@ def upgrade():
             cancel_url="https://yourdomain.com/cancel",
             customer=stripe_customer_id or None,
             customer_email=email if not stripe_customer_id else None,
+            metadata={"tier": tier, "email": email},
         )
         
         return jsonify({
@@ -430,12 +436,47 @@ def stripe_webhook():
     # Handle subscription events
     if event["type"] == "checkout.session.completed":
         session_obj = event["data"]["object"]
-        customer_email = session_obj.get("customer_email")
-        
-        # Extract tier from metadata or session details
-        # Update user tier in database
-        # (Implement based on your tier mapping)
-    
+        metadata = session_obj.get("metadata") or {}
+        tier = metadata.get("tier")
+        customer_email = metadata.get("email") or session_obj.get("customer_email")
+        stripe_customer = session_obj.get("customer")
+        amount_total = (session_obj.get("amount_total") or 0) / 100.0
+
+        if customer_email and tier in PRICING_TIERS:
+            conn = sqlite3.connect("ensemble_chat.db")
+            c = conn.cursor()
+            c.execute("SELECT id FROM users WHERE email=?", (customer_email,))
+            row = c.fetchone()
+            if row:
+                user_id = row[0]
+                c.execute(
+                    "UPDATE users SET tier=?, stripe_customer_id=COALESCE(?, stripe_customer_id), "
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (tier, stripe_customer, user_id),
+                )
+                c.execute(
+                    "INSERT INTO transactions (user_id, stripe_charge_id, amount, tier, status) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (user_id, session_obj.get("id"), amount_total, tier, "completed"),
+                )
+                conn.commit()
+            conn.close()
+
+    elif event["type"] == "customer.subscription.deleted":
+        subscription = event["data"]["object"]
+        stripe_customer = subscription.get("customer")
+
+        if stripe_customer:
+            conn = sqlite3.connect("ensemble_chat.db")
+            c = conn.cursor()
+            c.execute(
+                "UPDATE users SET tier='free', updated_at=CURRENT_TIMESTAMP "
+                "WHERE stripe_customer_id=?",
+                (stripe_customer,),
+            )
+            conn.commit()
+            conn.close()
+
     return jsonify({"status": "success"})
 
 # Error handlers
