@@ -1,6 +1,15 @@
 """
-Ensemble Chat API - Main Application
+Ensemble Chat API - Serverless Inference API variant
 Flask API with Stripe payment integration
+
+NO-GPU VARIANT: instead of downloading Mistral-7B and Falcon-7B locally
+(which needs ~28GB+ of GPU VRAM), this version calls the Hugging Face
+Serverless Inference API. It runs on any CPU-only host (e.g. free
+Hugging Face Spaces).
+
+Required env: HUGGINGFACE_TOKEN (or HF_TOKEN) - a Hugging Face Read token.
+You must also accept the gated-model license for
+mistralai/Mistral-7B-Instruct-v0.1 on huggingface.co while logged in.
 """
 
 import os
@@ -15,8 +24,7 @@ from flask_cors import CORS
 import stripe
 from dotenv import load_dotenv
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from huggingface_hub import InferenceClient
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 
@@ -44,7 +52,7 @@ def init_db():
     """Initialize SQLite database"""
     conn = sqlite3.connect("ensemble_chat.db")
     c = conn.cursor()
-    
+
     # Users table
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -57,7 +65,7 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    
+
     # Usage tracking table
     c.execute("""
         CREATE TABLE IF NOT EXISTS usage (
@@ -68,7 +76,7 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     """)
-    
+
     # Transactions table
     c.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
@@ -82,53 +90,38 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     """)
-    
+
     conn.commit()
     conn.close()
 
-# Initialize models
+# Initialize models via Hugging Face Serverless Inference API (no local GPU needed)
 def load_models():
-    """Load Mistral and Falcon models"""
-    print("Loading models...")
+    """Set up the Inference API client and return it with the two ensemble model IDs"""
+    print("Setting up Hugging Face Inference API client (no local GPU needed)...")
 
-    hf_token = os.getenv("HUGGINGFACE_TOKEN")
+    # Accept either env var name (this repo uses HUGGINGFACE_TOKEN, ai-api-stripe uses HF_TOKEN)
+    hf_token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
     if not hf_token:
-        print("WARNING: HUGGINGFACE_TOKEN is not set - gated models (Mistral) may fail to download")
+        print("WARNING: HUGGINGFACE_TOKEN (or HF_TOKEN) is not set - gated models (Mistral) will fail")
+
+    try:
+        # huggingface_hub >= 0.23 uses api_key=
+        client = InferenceClient(api_key=hf_token)
+    except TypeError:
+        # older huggingface_hub (e.g. 0.19.x) uses token=
+        client = InferenceClient(token=hf_token)
 
     MODEL_A = "mistralai/Mistral-7B-Instruct-v0.1"
     MODEL_B = "tiiuae/falcon-7b-instruct"
+    return client, [MODEL_A, MODEL_B]
 
-    def safe_load(model_name):
-        tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype=torch.float16,
-            token=hf_token,
-        )
-        gen = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            framework="pt",
-            max_new_tokens=256,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
-        )
-        return gen
-    
-    gen_a = safe_load(MODEL_A)
-    gen_b = safe_load(MODEL_B)
-    return [gen_a, gen_b]
-
-# Load models on startup
+# Set up inference client on startup
 try:
-    MODELS = load_models()
-    print("✅ Models loaded successfully")
+    HF_CLIENT, MODELS = load_models()
+    print("Inference API client ready")
 except Exception as e:
-    print(f"❌ Error loading models: {e}")
-    MODELS = None
+    print(f"Error setting up Inference API client: {e}")
+    HF_CLIENT, MODELS = None, None
 
 # Helper functions
 def generate_api_key(email):
@@ -143,59 +136,69 @@ def get_user_usage(user_id, month=None):
     """Get user's API request usage for a month"""
     if month is None:
         month = get_current_month()
-    
+
     conn = sqlite3.connect("ensemble_chat.db")
     c = conn.cursor()
     c.execute("SELECT requests FROM usage WHERE user_id=? AND month=?", (user_id, month))
     result = c.fetchone()
     conn.close()
-    
+
     return result[0] if result else 0
 
 def increment_usage(user_id, requests=1):
     """Increment user's API request count"""
     month = get_current_month()
-    
+
     conn = sqlite3.connect("ensemble_chat.db")
     c = conn.cursor()
-    
+
     c.execute("SELECT id FROM usage WHERE user_id=? AND month=?", (user_id, month))
     if c.fetchone():
-        c.execute("UPDATE usage SET requests = requests + ? WHERE user_id=? AND month=?", 
+        c.execute("UPDATE usage SET requests = requests + ? WHERE user_id=? AND month=?",
                  (requests, user_id, month))
     else:
         c.execute("INSERT INTO usage (user_id, requests, month) VALUES (?, ?, ?)",
                  (user_id, requests, month))
-    
+
     conn.commit()
     conn.close()
 
-def call_gen(gen, prompt, max_new_tokens=180):
-    """Call a single generator"""
-    out = gen(prompt, max_new_tokens=max_new_tokens, return_full_text=False)
-    text = out[0].get("generated_text") or out[0].get("text") or str(out[0])
+def call_gen(client, model_id, prompt, max_new_tokens=180):
+    """Call a single model through the Hugging Face Inference API"""
+    out = client.text_generation(
+        prompt,
+        model=model_id,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=0.7,
+        top_p=0.9,
+    )
+    if isinstance(out, str):
+        text = out
+    else:
+        text = out.get("generated_text") or out.get("text") or str(out)
     return text.strip()
 
 def ask_ensemble(prompt):
     """Query both models and return best answer"""
-    if not MODELS:
+    if not HF_CLIENT or not MODELS:
         return {"error": "Models not loaded"}
-    
+
     with ThreadPoolExecutor(max_workers=len(MODELS)) as ex:
-        futures = [ex.submit(call_gen, g, prompt) for g in MODELS]
+        futures = [ex.submit(call_gen, HF_CLIENT, m, prompt) for m in MODELS]
         results = [f.result() for f in futures]
-    
+
     cleaned = [r for r in results if r and r.strip()]
-    
+
     if not cleaned:
         return {"answer": "", "strategy": "empty"}
-    
+
     cnt = Counter(cleaned)
     top, freq = cnt.most_common(1)[0]
-    
+
     if freq >= 2:
         return {"answer": top, "strategy": "majority"}
-    
+
     longest = max(cleaned, key=len)
     return {"answer": longest, "strategy": "longest"}
 
@@ -207,29 +210,29 @@ def require_api_key(f):
         api_key = request.headers.get("X-API-Key")
         if not api_key:
             return jsonify({"error": "Missing API key"}), 401
-        
+
         conn = sqlite3.connect("ensemble_chat.db")
         c = conn.cursor()
         c.execute("SELECT id, tier FROM users WHERE api_key=?", (api_key,))
         result = c.fetchone()
         conn.close()
-        
+
         if not result:
             return jsonify({"error": "Invalid API key"}), 401
-        
+
         user_id, tier = result
-        
+
         # Check rate limit
         usage = get_user_usage(user_id)
         limit = PRICING_TIERS[tier]["requests_per_month"]
-        
+
         if usage >= limit:
             return jsonify({"error": f"Rate limit exceeded. Max {limit} requests/month"}), 429
-        
+
         request.user_id = user_id
         request.tier = tier
         return f(*args, **kwargs)
-    
+
     return decorated
 
 # Routes - Public
@@ -239,7 +242,7 @@ def index():
     return jsonify({
         "name": "Ensemble Chat API",
         "version": "1.0.0",
-        "description": "AI-powered ensemble chatbot API with Mistral & Falcon",
+        "description": "AI-powered ensemble chatbot API with Mistral & Falcon (serverless inference, no GPU)",
         "docs": "/docs",
         "pricing": "/pricing"
     })
@@ -275,12 +278,12 @@ def signup():
     """Create new user account"""
     data = request.json
     email = data.get("email")
-    
+
     if not email:
         return jsonify({"error": "Email required"}), 400
-    
+
     api_key = generate_api_key(email)
-    
+
     try:
         conn = sqlite3.connect("ensemble_chat.db")
         c = conn.cursor()
@@ -289,7 +292,7 @@ def signup():
         conn.commit()
         user_id = c.lastrowid
         conn.close()
-        
+
         return jsonify({
             "success": True,
             "email": email,
@@ -297,7 +300,7 @@ def signup():
             "tier": "free",
             "message": "Account created! Use your API key to make requests."
         }), 201
-    
+
     except sqlite3.IntegrityError:
         return jsonify({"error": "Email already exists"}), 400
 
@@ -306,16 +309,16 @@ def login():
     """Login and get API key"""
     data = request.json
     email = data.get("email")
-    
+
     conn = sqlite3.connect("ensemble_chat.db")
     c = conn.cursor()
     c.execute("SELECT api_key, tier FROM users WHERE email=?", (email,))
     result = c.fetchone()
     conn.close()
-    
+
     if not result:
         return jsonify({"error": "User not found"}), 404
-    
+
     api_key, tier = result
     return jsonify({
         "email": email,
@@ -330,21 +333,21 @@ def chat():
     """Chat with ensemble chatbot"""
     data = request.json
     prompt = data.get("prompt")
-    
+
     if not prompt:
         return jsonify({"error": "Prompt required"}), 400
-    
+
     # Get ensemble response
     response = ask_ensemble(prompt)
-    
+
     if "error" in response:
         return jsonify(response), 500
-    
+
     # Increment usage
     increment_usage(request.user_id)
     usage = get_user_usage(request.user_id)
     limit = PRICING_TIERS[request.tier]["requests_per_month"]
-    
+
     return jsonify({
         "prompt": prompt,
         "answer": response["answer"],
@@ -363,7 +366,7 @@ def usage():
     usage_count = get_user_usage(request.user_id)
     tier = request.tier
     limit = PRICING_TIERS[tier]["requests_per_month"]
-    
+
     return jsonify({
         "tier": tier,
         "requests_this_month": usage_count,
@@ -379,21 +382,21 @@ def upgrade():
     data = request.json
     email = data.get("email")
     tier = data.get("tier")  # "starter" or "pro"
-    
+
     if tier not in ["starter", "pro"]:
         return jsonify({"error": "Invalid tier"}), 400
-    
+
     conn = sqlite3.connect("ensemble_chat.db")
     c = conn.cursor()
     c.execute("SELECT id, stripe_customer_id FROM users WHERE email=?", (email,))
     result = c.fetchone()
     conn.close()
-    
+
     if not result:
         return jsonify({"error": "User not found"}), 404
-    
+
     user_id, stripe_customer_id = result
-    
+
     try:
         # Create Stripe checkout session
         session_obj = stripe.checkout.Session.create(
@@ -409,12 +412,12 @@ def upgrade():
             customer_email=email if not stripe_customer_id else None,
             metadata={"tier": tier, "email": email},
         )
-        
+
         return jsonify({
             "checkout_url": session_obj.url,
             "session_id": session_obj.id
         })
-    
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -423,7 +426,7 @@ def stripe_webhook():
     """Handle Stripe webhook events"""
     payload = request.get_data()
     sig_header = request.headers.get("Stripe-Signature")
-    
+
     try:
         event = stripe.Webhook.construct_event(
             payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET")
@@ -432,7 +435,7 @@ def stripe_webhook():
         return jsonify({"error": "Invalid payload"}), 400
     except stripe.error.SignatureVerificationError:
         return jsonify({"error": "Invalid signature"}), 400
-    
+
     # Handle subscription events
     if event["type"] == "checkout.session.completed":
         session_obj = event["data"]["object"]
