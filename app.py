@@ -244,8 +244,150 @@ def index():
         "version": "1.0.0",
         "description": "AI-powered ensemble chatbot API with Mistral & Falcon (serverless inference, no GPU)",
         "docs": "/docs",
-        "pricing": "/pricing"
+        "pricing": "/pricing",
+        "demo": "/demo"
     })
+
+# Routes - Web pages
+@app.route("/demo", methods=["GET"])
+def demo():
+    """Simple demo/chat page: enter API key + prompt, see the ensemble response."""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ensemble Chat - Demo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { margin-bottom: 0.25rem; }
+  p.sub { color: #555; margin-top: 0; }
+  label { font-weight: 600; display: block; margin-top: 1rem; }
+  input, textarea { width: 100%; padding: 0.5rem; margin-top: 0.25rem; box-sizing: border-box; font-size: 1rem; }
+  textarea { min-height: 90px; }
+  button { margin-top: 1rem; padding: 0.6rem 1.4rem; font-size: 1rem; cursor: pointer; }
+  #result { margin-top: 1.5rem; padding: 1rem; border: 1px solid #ccc; border-radius: 8px; background: #fafafa; white-space: pre-wrap; display: none; }
+  #result .meta { color: #666; font-size: 0.85rem; margin-top: 0.75rem; }
+  .row { display: flex; gap: 0.5rem; align-items: end; }
+  .row .grow { flex: 1; }
+  .hint { font-size: 0.85rem; color: #666; }
+</style>
+</head>
+<body>
+  <h1>Ensemble Chat - Demo</h1>
+  <p class="sub">Ask Mistral &amp; Falcon together. Free tier: 100 requests/month.</p>
+
+  <div class="row">
+    <div class="grow">
+      <label for="email">Email (to get a free API key)</label>
+      <input id="email" type="email" placeholder="you@example.com">
+    </div>
+    <button id="signupBtn" type="button">Get API key</button>
+  </div>
+
+  <label for="apikey">API key</label>
+  <input id="apikey" type="password" placeholder="paste your API key here">
+
+  <label for="prompt">Prompt</label>
+  <textarea id="prompt" placeholder="What is machine learning?"></textarea>
+
+  <button id="askBtn" type="button">Ask the ensemble</button>
+
+  <div id="result"></div>
+
+<script>
+async function signup() {
+  const email = document.getElementById('email').value.trim();
+  if (!email) { alert('Enter your email first.'); return; }
+  const res = await fetch('/auth/signup', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({email})
+  });
+  const data = await res.json();
+  if (data.api_key) {
+    document.getElementById('apikey').value = data.api_key;
+    alert('API key created and filled in below. You are on the free tier.');
+  } else {
+    alert('Signup: ' + (data.error || 'unknown error'));
+  }
+}
+
+async function ask() {
+  const apiKey = document.getElementById('apikey').value.trim();
+  const prompt = document.getElementById('prompt').value.trim();
+  const result = document.getElementById('result');
+  if (!apiKey) { alert('Enter your API key first.'); return; }
+  if (!prompt) { alert('Type a prompt first.'); return; }
+  result.style.display = 'block';
+  result.textContent = 'Thinking... (models can take a while on the free plan)';
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-API-Key': apiKey},
+      body: JSON.stringify({prompt})
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      result.textContent = 'Error: ' + (data.error || res.statusText);
+      return;
+    }
+    result.innerHTML = '';
+    const answer = document.createElement('div');
+    answer.textContent = data.answer;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = 'Strategy: ' + data.strategy +
+      ' | Usage: ' + data.usage.requests_this_month + '/' + data.usage.limit + ' this month';
+    result.appendChild(answer);
+    result.appendChild(meta);
+  } catch (e) {
+    result.textContent = 'Network error: ' + e.message;
+  }
+}
+
+document.getElementById('signupBtn').addEventListener('click', signup);
+document.getElementById('askBtn').addEventListener('click', ask);
+</script>
+</body>
+</html>
+    """
+
+@app.route("/success", methods=["GET"])
+def success():
+    """Checkout success page"""
+    session_id = request.args.get("session_id", "")
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subscription successful</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 3rem auto; padding: 0 1rem;">
+  <h1>You're subscribed!</h1>
+  <p>Thanks — your payment went through and your plan is being activated. It can take a minute for the upgrade to show on your account.</p>
+  <p>Your new limits apply to the API key tied to the email you checked out with.</p>
+  <p><a href="/demo">Try the demo</a> &middot; <a href="/docs">API docs</a></p>
+  <p style="color:#888; font-size:0.8rem;">Checkout session: {session_id}</p>
+</body>
+</html>
+    """
+
+@app.route("/cancel", methods=["GET"])
+def cancel():
+    """Checkout cancelled page"""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checkout cancelled</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 3rem auto; padding: 0 1rem;">
+  <h1>Checkout cancelled</h1>
+  <p>No worries — nothing was charged. You're still on the free tier (100 requests/month).</p>
+  <p><a href="/pricing">See plans</a> &middot; <a href="/demo">Try the demo</a></p>
+</body>
+</html>
+    """
 
 @app.route("/pricing", methods=["GET"])
 def pricing():
@@ -406,8 +548,8 @@ def upgrade():
                 "quantity": 1,
             }],
             mode="subscription",
-            success_url="https://yourdomain.com/success?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url="https://yourdomain.com/cancel",
+            success_url="https://ensemble-chat.onrender.com/success?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url="https://ensemble-chat.onrender.com/cancel",
             customer=stripe_customer_id or None,
             customer_email=email if not stripe_customer_id else None,
             metadata={"tier": tier, "email": email},
