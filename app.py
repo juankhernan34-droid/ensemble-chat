@@ -169,7 +169,7 @@ def call_gen(client, model_id, prompt, max_new_tokens=180):
     import requests
     hf_token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
     # Use the OpenAI-compatible chat completions endpoint on the new router
-    url = "https://router.huggingface.co/hf-inference/v1/chat/completions"
+    url = "https://router.huggingface.co/v1/chat/completions"
     headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
     payload = {
         "model": model_id,
