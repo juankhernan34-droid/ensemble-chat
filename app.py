@@ -105,8 +105,9 @@ def load_models():
         print("WARNING: HUGGINGFACE_TOKEN (or HF_TOKEN) is not set - gated models (Mistral) will fail")
 
     try:
-        # huggingface_hub >= 0.23 uses api_key=
-        client = InferenceClient(api_key=hf_token)
+        # huggingface_hub >= 0.23 uses api_key=; force the new router endpoint
+        # (api-inference.huggingface.co was deprecated and no longer resolves)
+        client = InferenceClient(api_key=hf_token, base_url="https://router.huggingface.co")
     except TypeError:
         # older huggingface_hub (e.g. 0.19.x) uses token=
         client = InferenceClient(token=hf_token)
