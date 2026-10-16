@@ -112,8 +112,8 @@ def load_models():
         # older huggingface_hub (e.g. 0.19.x) uses token=
         client = InferenceClient(token=hf_token)
 
-    MODEL_A = "mistralai/Mistral-7B-Instruct-v0.1"
-    MODEL_B = "tiiuae/falcon-7b-instruct"
+    MODEL_A = "meta-llama/Llama-3.2-3B-Instruct"
+    MODEL_B = "mistralai/Mistral-7B-Instruct-v0.3"
     return client, [MODEL_A, MODEL_B]
 
 # Set up inference client on startup
