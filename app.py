@@ -198,7 +198,15 @@ def safe_call_gen(client, model_id, prompt, max_new_tokens=180):
         return call_gen(client, model_id, prompt, max_new_tokens)
     except Exception as e:
         # Don't leak tokens; HF errors are safe to surface
-        return f"__ERROR__{type(e).__name__}: {str(e)[:200]}"
+        # Include response body for HTTP errors to aid debugging
+        detail = str(e)[:200]
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                body = e.response.text[:300]
+                detail += f" | Body: {body}"
+            except:
+                pass
+        return f"__ERROR__{type(e).__name__}: {detail}"
 
 def ask_ensemble(prompt):
     """Query both models and return best answer"""
