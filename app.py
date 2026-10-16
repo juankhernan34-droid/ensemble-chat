@@ -168,23 +168,23 @@ def call_gen(client, model_id, prompt, max_new_tokens=180):
     """Call a single model through the Hugging Face Inference API via direct HTTP"""
     import requests
     hf_token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
-    # Use the new router endpoint directly (api-inference.huggingface.co is dead)
-    url = f"https://router.huggingface.co/hf-inference/models/{model_id}"
+    # Use the OpenAI-compatible chat completions endpoint on the new router
+    url = "https://router.huggingface.co/hf-inference/v1/chat/completions"
     headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
     payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": max_new_tokens,
-            "do_sample": True,
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "return_full_text": False,
-        },
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_new_tokens,
+        "temperature": 0.7,
+        "top_p": 0.9,
     }
     resp = requests.post(url, headers=headers, json=payload, timeout=60)
     resp.raise_for_status()
     out = resp.json()
-    if isinstance(out, list) and out:
+    # OpenAI-compatible format: choices[0].message.content
+    if isinstance(out, dict) and "choices" in out and out["choices"]:
+        text = out["choices"][0].get("message", {}).get("content", "")
+    elif isinstance(out, list) and out:
         text = out[0].get("generated_text", "")
     elif isinstance(out, dict):
         text = out.get("generated_text", "")
