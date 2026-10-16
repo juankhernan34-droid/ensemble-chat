@@ -179,19 +179,29 @@ def call_gen(client, model_id, prompt, max_new_tokens=180):
         text = out.get("generated_text") or out.get("text") or str(out)
     return text.strip()
 
+def safe_call_gen(client, model_id, prompt, max_new_tokens=180):
+    """Call one model, returning error string instead of raising"""
+    try:
+        return call_gen(client, model_id, prompt, max_new_tokens)
+    except Exception as e:
+        # Don't leak tokens; HF errors are safe to surface
+        return f"__ERROR__{type(e).__name__}: {str(e)[:200]}"
+
 def ask_ensemble(prompt):
     """Query both models and return best answer"""
     if not HF_CLIENT or not MODELS:
-        return {"error": "Models not loaded"}
+        return {"error": "Models not loaded: HF client failed to initialize (check HUGGINGFACE_TOKEN)"}
 
     with ThreadPoolExecutor(max_workers=len(MODELS)) as ex:
-        futures = [ex.submit(call_gen, HF_CLIENT, m, prompt) for m in MODELS]
+        futures = [ex.submit(safe_call_gen, HF_CLIENT, m, prompt) for m in MODELS]
         results = [f.result() for f in futures]
 
-    cleaned = [r for r in results if r and r.strip()]
+    errors = [r for r in results if r.startswith("__ERROR__")]
+    cleaned = [r for r in results if r and r.strip() and not r.startswith("__ERROR__")]
 
     if not cleaned:
-        return {"answer": "", "strategy": "empty"}
+        detail = errors[0].replace("__ERROR__", "") if errors else "unknown"
+        return {"error": f"All models failed: {detail}"}
 
     cnt = Counter(cleaned)
     top, freq = cnt.most_common(1)[0]
