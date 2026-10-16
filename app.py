@@ -165,19 +165,31 @@ def increment_usage(user_id, requests=1):
     conn.close()
 
 def call_gen(client, model_id, prompt, max_new_tokens=180):
-    """Call a single model through the Hugging Face Inference API"""
-    out = client.text_generation(
-        prompt,
-        model=model_id,
-        max_new_tokens=max_new_tokens,
-        do_sample=True,
-        temperature=0.7,
-        top_p=0.9,
-    )
-    if isinstance(out, str):
-        text = out
+    """Call a single model through the Hugging Face Inference API via direct HTTP"""
+    import requests
+    hf_token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
+    # Use the new router endpoint directly (api-inference.huggingface.co is dead)
+    url = f"https://router.huggingface.co/hf-inference/models/{model_id}"
+    headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": True,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "return_full_text": False,
+        },
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    resp.raise_for_status()
+    out = resp.json()
+    if isinstance(out, list) and out:
+        text = out[0].get("generated_text", "")
+    elif isinstance(out, dict):
+        text = out.get("generated_text", "")
     else:
-        text = out.get("generated_text") or out.get("text") or str(out)
+        text = str(out)
     return text.strip()
 
 def safe_call_gen(client, model_id, prompt, max_new_tokens=180):
