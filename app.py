@@ -112,8 +112,13 @@ def load_models():
         # older huggingface_hub (e.g. 0.19.x) uses token=
         client = InferenceClient(token=hf_token)
 
-    MODEL_A = "Qwen/Qwen2.5-7B-Instruct"
-    MODEL_B = "HuggingFaceH4/zephyr-7b-beta"
+    if os.getenv("GROQ_API_KEY"):
+        # Groq free-tier models (OpenAI-compatible, no card required)
+        MODEL_A = "openai/gpt-oss-20b"
+        MODEL_B = "openai/gpt-oss-120b"
+    else:
+        MODEL_A = "Qwen/Qwen2.5-7B-Instruct"
+        MODEL_B = "HuggingFaceH4/zephyr-7b-beta"
     return client, [MODEL_A, MODEL_B]
 
 # Set up inference client on startup
@@ -165,12 +170,23 @@ def increment_usage(user_id, requests=1):
     conn.close()
 
 def call_gen(client, model_id, prompt, max_new_tokens=180):
-    """Call a single model through the Hugging Face Inference API via direct HTTP"""
+    """Call a single model through the configured inference provider via direct HTTP.
+
+    Provider selection (env):
+      GROQ_API_KEY set  -> Groq (free tier, OpenAI-compatible)
+      otherwise          -> Hugging Face router (needs credits/providers)
+    """
     import requests
-    hf_token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
-    # Use the OpenAI-compatible chat completions endpoint on the new router
-    url = "https://router.huggingface.co/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key:
+        # Groq: OpenAI-compatible, free tier, no card required
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+    else:
+        hf_token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
+        # Use the OpenAI-compatible chat completions endpoint on the new router
+        url = "https://router.huggingface.co/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
     payload = {
         "model": model_id,
         "messages": [{"role": "user", "content": prompt}],
@@ -654,18 +670,3 @@ def stripe_webhook():
             conn.close()
 
     return jsonify({"status": "success"})
-
-# Error handlers
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({"error": "Not found"}), 404
-
-@app.errorhandler(500)
-def server_error(error):
-    return jsonify({"error": "Internal server error"}), 500
-
-# Initialize database on startup (works under gunicorn too, not just __main__)
-init_db()
-
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
