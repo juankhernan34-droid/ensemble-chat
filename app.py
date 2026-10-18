@@ -1,5 +1,5 @@
 """
-Ensemble Chat API - Serverless Inference API variant
+Atlas Chat API - Serverless Inference API variant
 Flask API with Stripe payment integration
 
 NO-GPU VARIANT: instead of downloading Mistral-7B and Falcon-7B locally
@@ -148,7 +148,6 @@ def get_user_usage(user_id, month=None):
     c.execute("SELECT requests FROM usage WHERE user_id=? AND month=?", (user_id, month))
     result = c.fetchone()
     conn.close()
-
     return result[0] if result else 0
 
 def increment_usage(user_id, requests=1):
@@ -285,15 +284,71 @@ def require_api_key(f):
 # Routes - Public
 @app.route("/", methods=["GET"])
 def index():
-    """Home page"""
-    return jsonify({
-        "name": "Ensemble Chat API",
-        "version": "1.0.0",
-        "description": "AI-powered ensemble chatbot API with Mistral & Falcon (serverless inference, no GPU)",
-        "docs": "/docs",
-        "pricing": "/pricing",
-        "demo": "/demo"
-    })
+    """Home page - SEO-friendly landing page"""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atlas Chat - AI Chatbot API</title>
+<meta name="description" content="Atlas Chat is an AI-powered chatbot API. Two AI models working together to give you the best answer. Free tier with 100 requests/month. Try the live demo.">
+<meta name="keywords" content="AI chatbot, chatbot API, AI API, ensemble AI, GPT, artificial intelligence">
+<meta property="og:title" content="Atlas Chat - AI Chatbot API">
+<meta property="og:description" content="Two AI models working together. Free tier, live demo, simple API.">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Atlas Chat - AI Chatbot API">
+<meta name="twitter:description" content="Two AI models working together. Free tier, live demo, simple API.">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 700px; margin: 3rem auto; padding: 0 1.5rem; line-height: 1.6; color: #1a1a1a; }
+  h1 { font-size: 2.2rem; margin-bottom: 0.25rem; }
+  p.tagline { font-size: 1.2rem; color: #444; margin-top: 0; }
+  .cta { display: inline-block; margin: 1rem 0.5rem 0 0; padding: 0.7rem 1.6rem; font-size: 1rem; text-decoration: none; border-radius: 8px; }
+  .cta-primary { background: #1a73e8; color: #fff; }
+  .cta-secondary { border: 1px solid #ccc; color: #1a1a1a; }
+  .features { margin-top: 2rem; }
+  .features li { margin-bottom: 0.5rem; }
+  footer { margin-top: 3rem; font-size: 0.85rem; color: #888; }
+</style>
+</head>
+<body>
+  <h1>Atlas Chat</h1>
+  <p class="tagline">Two AI minds. One best answer.</p>
+  <p>Atlas Chat is an AI chatbot API powered by an ensemble of two large language models. Ask once, get the smartest answer — with a free tier to get you started.</p>
+  <a class="cta cta-primary" href="/demo">Try the Live Demo</a>
+  <a class="cta cta-secondary" href="/docs">API Docs</a>
+  <a class="cta cta-secondary" href="/pricing">Pricing</a>
+  <div class="features">
+    <h2>Why Atlas Chat?</h2>
+    <ul>
+      <li><strong>Ensemble intelligence</strong> — two models vote on the best answer</li>
+      <li><strong>Simple API</strong> — one POST request, JSON in and out</li>
+      <li><strong>Free tier</strong> — 100 requests/month, no credit card</li>
+      <li><strong>Paid plans</strong> — Starter $4.99/mo, Pro $14.99/mo</li>
+    </ul>
+  </div>
+  <footer>Atlas Chat API &middot; <a href="/docs">Docs</a> &middot; <a href="/pricing">Pricing</a></footer>
+</body>
+</html>
+    """
+
+@app.route("/robots.txt", methods=["GET"])
+def robots():
+    """Robots.txt for search engine crawlers"""
+    return "User-agent: *\nAllow: /\nSitemap: https://ensemble-chat.onrender.com/sitemap.xml\n", 200, {"Content-Type": "text/plain"}
+
+@app.route("/sitemap.xml", methods=["GET"])
+def sitemap():
+    """Sitemap for search engines"""
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://ensemble-chat.onrender.com/</loc><priority>1.0</priority></url>
+  <url><loc>https://ensemble-chat.onrender.com/demo</loc><priority>0.9</priority></url>
+  <url><loc>https://ensemble-chat.onrender.com/docs</loc><priority>0.7</priority></url>
+  <url><loc>https://ensemble-chat.onrender.com/pricing</loc><priority>0.7</priority></url>
+</urlset>
+""", 200, {"Content-Type": "application/xml"}
 
 # Routes - Web pages
 @app.route("/demo", methods=["GET"])
@@ -305,7 +360,10 @@ def demo():
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ensemble Chat - Demo</title>
+<title>Atlas Chat - Live Demo | Try the AI Chatbot Free</title>
+<meta name="description" content="Try Atlas Chat free — ask our AI ensemble anything. Two AI models, one best answer. No signup needed to see it work.">
+<meta property="og:title" content="Atlas Chat - Live Demo">
+<meta property="og:description" content="Try the AI chatbot free. Two models, one best answer.">
 <style>
   body { font-family: system-ui, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
   h1 { margin-bottom: 0.25rem; }
@@ -322,7 +380,7 @@ def demo():
 </style>
 </head>
 <body>
-  <h1>Ensemble Chat - Demo</h1>
+  <h1>Atlas Chat - Demo</h1>
   <p class="sub">Ask Mistral &amp; Falcon together. Free tier: 100 requests/month.</p>
 
   <div class="row">
@@ -445,7 +503,7 @@ def pricing():
 def docs():
     """API documentation"""
     return jsonify({
-        "title": "Ensemble Chat API Documentation",
+        "title": "Atlas Chat API Documentation",
         "endpoints": {
             "POST /auth/signup": "Create new account",
             "POST /auth/login": "Get API key",
