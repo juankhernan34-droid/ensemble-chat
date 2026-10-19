@@ -91,8 +91,43 @@ def init_db():
         )
     """)
 
+    # Visits table (simple visitor counter)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS visits (
+            id INTEGER PRIMARY KEY,
+            path TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     conn.close()
+
+def log_visit(path):
+    """Log a page visit (simple counter, no personal data)"""
+    try:
+        conn = sqlite3.connect("ensemble_chat.db")
+        c = conn.cursor()
+        c.execute("INSERT INTO visits (path) VALUES (?)", (path,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def get_visit_count(path=None):
+    """Get total visit count, optionally filtered by path"""
+    try:
+        conn = sqlite3.connect("ensemble_chat.db")
+        c = conn.cursor()
+        if path:
+            c.execute("SELECT COUNT(*) FROM visits WHERE path=?", (path,))
+        else:
+            c.execute("SELECT COUNT(*) FROM visits")
+        result = c.fetchone()
+        conn.close()
+        return result[0] if result else 0
+    except Exception:
+        return 0
 
 # Initialize models via Hugging Face Serverless Inference API (no local GPU needed)
 def load_models():
@@ -148,6 +183,7 @@ def get_user_usage(user_id, month=None):
     c.execute("SELECT requests FROM usage WHERE user_id=? AND month=?", (user_id, month))
     result = c.fetchone()
     conn.close()
+
     return result[0] if result else 0
 
 def increment_usage(user_id, requests=1):
@@ -285,6 +321,7 @@ def require_api_key(f):
 @app.route("/", methods=["GET"])
 def index():
     """Home page - SEO-friendly landing page"""
+    log_visit("/")
     return """
 <!DOCTYPE html>
 <html lang="en">
@@ -351,9 +388,19 @@ def sitemap():
 """, 200, {"Content-Type": "application/xml"}
 
 # Routes - Web pages
+@app.route("/api/stats", methods=["GET"])
+def api_stats():
+    """Simple visitor stats (public)"""
+    return jsonify({
+        "total_visits": get_visit_count(),
+        "landing_page_visits": get_visit_count("/"),
+        "demo_visits": get_visit_count("/demo"),
+    })
+
 @app.route("/demo", methods=["GET"])
 def demo():
     """Simple demo/chat page: enter API key + prompt, see the ensemble response."""
+    log_visit("/demo")
     return """
 <!DOCTYPE html>
 <html lang="en">
