@@ -1,6 +1,15 @@
 """
-Ensemble Chat API - Main Application
+Atlas Chat API - Serverless Inference API variant
 Flask API with Stripe payment integration
+
+NO-GPU VARIANT: instead of downloading Mistral-7B and Falcon-7B locally
+(which needs ~28GB+ of GPU VRAM), this version calls the Hugging Face
+Serverless Inference API. It runs on any CPU-only host (e.g. free
+Hugging Face Spaces).
+
+Required env: HUGGINGFACE_TOKEN (or HF_TOKEN) - a Hugging Face Read token.
+You must also accept the gated-model license for
+mistralai/Mistral-7B-Instruct-v0.1 on huggingface.co while logged in.
 """
 
 import os
@@ -15,8 +24,7 @@ from flask_cors import CORS
 import stripe
 from dotenv import load_dotenv
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from huggingface_hub import InferenceClient
 from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 
@@ -44,7 +52,7 @@ def init_db():
     """Initialize SQLite database"""
     conn = sqlite3.connect("ensemble_chat.db")
     c = conn.cursor()
-    
+
     # Users table
     c.execute("""
         CREATE TABLE IF NOT EXISTS users (
@@ -57,7 +65,7 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    
+
     # Usage tracking table
     c.execute("""
         CREATE TABLE IF NOT EXISTS usage (
@@ -68,7 +76,7 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     """)
-    
+
     # Transactions table
     c.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
@@ -82,53 +90,79 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     """)
-    
+
+    # Visits table (simple visitor counter)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS visits (
+            id INTEGER PRIMARY KEY,
+            path TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     conn.commit()
     conn.close()
 
-# Initialize models
+def log_visit(path):
+    """Log a page visit (simple counter, no personal data)"""
+    try:
+        conn = sqlite3.connect("ensemble_chat.db")
+        c = conn.cursor()
+        c.execute("INSERT INTO visits (path) VALUES (?)", (path,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def get_visit_count(path=None):
+    """Get total visit count, optionally filtered by path"""
+    try:
+        conn = sqlite3.connect("ensemble_chat.db")
+        c = conn.cursor()
+        if path:
+            c.execute("SELECT COUNT(*) FROM visits WHERE path=?", (path,))
+        else:
+            c.execute("SELECT COUNT(*) FROM visits")
+        result = c.fetchone()
+        conn.close()
+        return result[0] if result else 0
+    except Exception:
+        return 0
+
+# Initialize models via Hugging Face Serverless Inference API (no local GPU needed)
 def load_models():
-    """Load Mistral and Falcon models"""
-    print("Loading models...")
+    """Set up the Inference API client and return it with the two ensemble model IDs"""
+    print("Setting up Hugging Face Inference API client (no local GPU needed)...")
 
-    hf_token = os.getenv("HUGGINGFACE_TOKEN")
+    # Accept either env var name (this repo uses HUGGINGFACE_TOKEN, ai-api-stripe uses HF_TOKEN)
+    hf_token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
     if not hf_token:
-        print("WARNING: HUGGINGFACE_TOKEN is not set - gated models (Mistral) may fail to download")
+        print("WARNING: HUGGINGFACE_TOKEN (or HF_TOKEN) is not set - gated models (Mistral) will fail")
 
-    MODEL_A = "mistralai/Mistral-7B-Instruct-v0.1"
-    MODEL_B = "tiiuae/falcon-7b-instruct"
+    try:
+        # huggingface_hub >= 0.23 uses api_key=; force the new router endpoint
+        # (api-inference.huggingface.co was deprecated and no longer resolves)
+        client = InferenceClient(api_key=hf_token, base_url="https://router.huggingface.co")
+    except TypeError:
+        # older huggingface_hub (e.g. 0.19.x) uses token=
+        client = InferenceClient(token=hf_token)
 
-    def safe_load(model_name):
-        tokenizer = AutoTokenizer.from_pretrained(model_name, token=hf_token)
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype=torch.float16,
-            token=hf_token,
-        )
-        gen = pipeline(
-            "text-generation",
-            model=model,
-            tokenizer=tokenizer,
-            framework="pt",
-            max_new_tokens=256,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.9,
-        )
-        return gen
-    
-    gen_a = safe_load(MODEL_A)
-    gen_b = safe_load(MODEL_B)
-    return [gen_a, gen_b]
+    if os.getenv("GROQ_API_KEY"):
+        # Groq free-tier models (OpenAI-compatible, no card required)
+        MODEL_A = "openai/gpt-oss-20b"
+        MODEL_B = "openai/gpt-oss-120b"
+    else:
+        MODEL_A = "Qwen/Qwen2.5-7B-Instruct"
+        MODEL_B = "HuggingFaceH4/zephyr-7b-beta"
+    return client, [MODEL_A, MODEL_B]
 
-# Load models on startup
+# Set up inference client on startup
 try:
-    MODELS = load_models()
-    print("✅ Models loaded successfully")
+    HF_CLIENT, MODELS = load_models()
+    print("Inference API client ready")
 except Exception as e:
-    print(f"❌ Error loading models: {e}")
-    MODELS = None
+    print(f"Error setting up Inference API client: {e}")
+    HF_CLIENT, MODELS = None, None
 
 # Helper functions
 def generate_api_key(email):
@@ -143,59 +177,110 @@ def get_user_usage(user_id, month=None):
     """Get user's API request usage for a month"""
     if month is None:
         month = get_current_month()
-    
+
     conn = sqlite3.connect("ensemble_chat.db")
     c = conn.cursor()
     c.execute("SELECT requests FROM usage WHERE user_id=? AND month=?", (user_id, month))
     result = c.fetchone()
     conn.close()
-    
+
     return result[0] if result else 0
 
 def increment_usage(user_id, requests=1):
     """Increment user's API request count"""
     month = get_current_month()
-    
+
     conn = sqlite3.connect("ensemble_chat.db")
     c = conn.cursor()
-    
+
     c.execute("SELECT id FROM usage WHERE user_id=? AND month=?", (user_id, month))
     if c.fetchone():
-        c.execute("UPDATE usage SET requests = requests + ? WHERE user_id=? AND month=?", 
+        c.execute("UPDATE usage SET requests = requests + ? WHERE user_id=? AND month=?",
                  (requests, user_id, month))
     else:
         c.execute("INSERT INTO usage (user_id, requests, month) VALUES (?, ?, ?)",
                  (user_id, requests, month))
-    
+
     conn.commit()
     conn.close()
 
-def call_gen(gen, prompt, max_new_tokens=180):
-    """Call a single generator"""
-    out = gen(prompt, max_new_tokens=max_new_tokens, return_full_text=False)
-    text = out[0].get("generated_text") or out[0].get("text") or str(out[0])
+def call_gen(client, model_id, prompt, max_new_tokens=180):
+    """Call a single model through the configured inference provider via direct HTTP.
+
+    Provider selection (env):
+      GROQ_API_KEY set  -> Groq (free tier, OpenAI-compatible)
+      otherwise          -> Hugging Face router (needs credits/providers)
+    """
+    import requests
+    groq_key = os.getenv("GROQ_API_KEY")
+    if groq_key:
+        # Groq: OpenAI-compatible, free tier, no card required
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+    else:
+        hf_token = os.getenv("HUGGINGFACE_TOKEN") or os.getenv("HF_TOKEN")
+        # Use the OpenAI-compatible chat completions endpoint on the new router
+        url = "https://router.huggingface.co/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
+    payload = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_new_tokens,
+        "temperature": 0.7,
+        "top_p": 0.9,
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    resp.raise_for_status()
+    out = resp.json()
+    # OpenAI-compatible format: choices[0].message.content
+    if isinstance(out, dict) and "choices" in out and out["choices"]:
+        text = out["choices"][0].get("message", {}).get("content", "")
+    elif isinstance(out, list) and out:
+        text = out[0].get("generated_text", "")
+    elif isinstance(out, dict):
+        text = out.get("generated_text", "")
+    else:
+        text = str(out)
     return text.strip()
+
+def safe_call_gen(client, model_id, prompt, max_new_tokens=180):
+    """Call one model, returning error string instead of raising"""
+    try:
+        return call_gen(client, model_id, prompt, max_new_tokens)
+    except Exception as e:
+        # Don't leak tokens; HF errors are safe to surface
+        # Include response body for HTTP errors to aid debugging
+        detail = str(e)[:200]
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                body = e.response.text[:300]
+                detail += f" | Body: {body}"
+            except:
+                pass
+        return f"__ERROR__{type(e).__name__}: {detail}"
 
 def ask_ensemble(prompt):
     """Query both models and return best answer"""
-    if not MODELS:
-        return {"error": "Models not loaded"}
-    
+    if not HF_CLIENT or not MODELS:
+        return {"error": "Models not loaded: HF client failed to initialize (check HUGGINGFACE_TOKEN)"}
+
     with ThreadPoolExecutor(max_workers=len(MODELS)) as ex:
-        futures = [ex.submit(call_gen, g, prompt) for g in MODELS]
+        futures = [ex.submit(safe_call_gen, HF_CLIENT, m, prompt) for m in MODELS]
         results = [f.result() for f in futures]
-    
-    cleaned = [r for r in results if r and r.strip()]
-    
+
+    errors = [r for r in results if r.startswith("__ERROR__")]
+    cleaned = [r for r in results if r and r.strip() and not r.startswith("__ERROR__")]
+
     if not cleaned:
-        return {"answer": "", "strategy": "empty"}
-    
+        detail = errors[0].replace("__ERROR__", "") if errors else "unknown"
+        return {"error": f"All models failed: {detail}"}
+
     cnt = Counter(cleaned)
     top, freq = cnt.most_common(1)[0]
-    
+
     if freq >= 2:
         return {"answer": top, "strategy": "majority"}
-    
+
     longest = max(cleaned, key=len)
     return {"answer": longest, "strategy": "longest"}
 
@@ -207,42 +292,254 @@ def require_api_key(f):
         api_key = request.headers.get("X-API-Key")
         if not api_key:
             return jsonify({"error": "Missing API key"}), 401
-        
+
         conn = sqlite3.connect("ensemble_chat.db")
         c = conn.cursor()
         c.execute("SELECT id, tier FROM users WHERE api_key=?", (api_key,))
         result = c.fetchone()
         conn.close()
-        
+
         if not result:
             return jsonify({"error": "Invalid API key"}), 401
-        
+
         user_id, tier = result
-        
+
         # Check rate limit
         usage = get_user_usage(user_id)
         limit = PRICING_TIERS[tier]["requests_per_month"]
-        
+
         if usage >= limit:
             return jsonify({"error": f"Rate limit exceeded. Max {limit} requests/month"}), 429
-        
+
         request.user_id = user_id
         request.tier = tier
         return f(*args, **kwargs)
-    
+
     return decorated
 
 # Routes - Public
 @app.route("/", methods=["GET"])
 def index():
-    """Home page"""
+    """Home page - SEO-friendly landing page"""
+    log_visit("/")
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atlas Chat - AI Chatbot API</title>
+<meta name="description" content="Atlas Chat is an AI-powered chatbot API. Two AI models working together to give you the best answer. Free tier with 100 requests/month. Try the live demo.">
+<meta name="keywords" content="AI chatbot, chatbot API, AI API, ensemble AI, GPT, artificial intelligence">
+<meta property="og:title" content="Atlas Chat - AI Chatbot API">
+<meta property="og:description" content="Two AI models working together. Free tier, live demo, simple API.">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="Atlas Chat - AI Chatbot API">
+<meta name="twitter:description" content="Two AI models working together. Free tier, live demo, simple API.">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 700px; margin: 3rem auto; padding: 0 1.5rem; line-height: 1.6; color: #1a1a1a; }
+  h1 { font-size: 2.2rem; margin-bottom: 0.25rem; }
+  p.tagline { font-size: 1.2rem; color: #444; margin-top: 0; }
+  .cta { display: inline-block; margin: 1rem 0.5rem 0 0; padding: 0.7rem 1.6rem; font-size: 1rem; text-decoration: none; border-radius: 8px; }
+  .cta-primary { background: #1a73e8; color: #fff; }
+  .cta-secondary { border: 1px solid #ccc; color: #1a1a1a; }
+  .features { margin-top: 2rem; }
+  .features li { margin-bottom: 0.5rem; }
+  footer { margin-top: 3rem; font-size: 0.85rem; color: #888; }
+</style>
+</head>
+<body>
+  <h1>Atlas Chat</h1>
+  <p class="tagline">Two AI minds. One best answer.</p>
+  <p>Atlas Chat is an AI chatbot API powered by an ensemble of two large language models. Ask once, get the smartest answer — with a free tier to get you started.</p>
+  <a class="cta cta-primary" href="/demo">Try the Live Demo</a>
+  <a class="cta cta-secondary" href="/docs">API Docs</a>
+  <a class="cta cta-secondary" href="/pricing">Pricing</a>
+  <div class="features">
+    <h2>Why Atlas Chat?</h2>
+    <ul>
+      <li><strong>Ensemble intelligence</strong> — two models vote on the best answer</li>
+      <li><strong>Simple API</strong> — one POST request, JSON in and out</li>
+      <li><strong>Free tier</strong> — 100 requests/month, no credit card</li>
+      <li><strong>Paid plans</strong> — Starter $4.99/mo, Pro $14.99/mo</li>
+    </ul>
+  </div>
+  <footer>Atlas Chat API &middot; <a href="/docs">Docs</a> &middot; <a href="/pricing">Pricing</a></footer>
+</body>
+</html>
+    """
+
+@app.route("/robots.txt", methods=["GET"])
+def robots():
+    """Robots.txt for search engine crawlers"""
+    return "User-agent: *\nAllow: /\nSitemap: https://ensemble-chat.onrender.com/sitemap.xml\n", 200, {"Content-Type": "text/plain"}
+
+@app.route("/sitemap.xml", methods=["GET"])
+def sitemap():
+    """Sitemap for search engines"""
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://ensemble-chat.onrender.com/</loc><priority>1.0</priority></url>
+  <url><loc>https://ensemble-chat.onrender.com/demo</loc><priority>0.9</priority></url>
+  <url><loc>https://ensemble-chat.onrender.com/docs</loc><priority>0.7</priority></url>
+  <url><loc>https://ensemble-chat.onrender.com/pricing</loc><priority>0.7</priority></url>
+</urlset>
+""", 200, {"Content-Type": "application/xml"}
+
+# Routes - Web pages
+@app.route("/api/stats", methods=["GET"])
+def api_stats():
+    """Simple visitor stats (public)"""
     return jsonify({
-        "name": "Ensemble Chat API",
-        "version": "1.0.0",
-        "description": "AI-powered ensemble chatbot API with Mistral & Falcon",
-        "docs": "/docs",
-        "pricing": "/pricing"
+        "total_visits": get_visit_count(),
+        "landing_page_visits": get_visit_count("/"),
+        "demo_visits": get_visit_count("/demo"),
     })
+
+@app.route("/demo", methods=["GET"])
+def demo():
+    """Simple demo/chat page: enter API key + prompt, see the ensemble response."""
+    log_visit("/demo")
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Atlas Chat - Live Demo | Try the AI Chatbot Free</title>
+<meta name="description" content="Try Atlas Chat free — ask our AI ensemble anything. Two AI models, one best answer. No signup needed to see it work.">
+<meta property="og:title" content="Atlas Chat - Live Demo">
+<meta property="og:description" content="Try the AI chatbot free. Two models, one best answer.">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { margin-bottom: 0.25rem; }
+  p.sub { color: #555; margin-top: 0; }
+  label { font-weight: 600; display: block; margin-top: 1rem; }
+  input, textarea { width: 100%; padding: 0.5rem; margin-top: 0.25rem; box-sizing: border-box; font-size: 1rem; }
+  textarea { min-height: 90px; }
+  button { margin-top: 1rem; padding: 0.6rem 1.4rem; font-size: 1rem; cursor: pointer; }
+  #result { margin-top: 1.5rem; padding: 1rem; border: 1px solid #ccc; border-radius: 8px; background: #fafafa; white-space: pre-wrap; display: none; }
+  #result .meta { color: #666; font-size: 0.85rem; margin-top: 0.75rem; }
+  .row { display: flex; gap: 0.5rem; align-items: end; }
+  .row .grow { flex: 1; }
+  .hint { font-size: 0.85rem; color: #666; }
+</style>
+</head>
+<body>
+  <h1>Atlas Chat - Demo</h1>
+  <p class="sub">Ask Mistral &amp; Falcon together. Free tier: 100 requests/month.</p>
+
+  <div class="row">
+    <div class="grow">
+      <label for="email">Email (to get a free API key)</label>
+      <input id="email" type="email" placeholder="you@example.com">
+    </div>
+    <button id="signupBtn" type="button">Get API key</button>
+  </div>
+
+  <label for="apikey">API key</label>
+  <input id="apikey" type="password" placeholder="paste your API key here">
+
+  <label for="prompt">Prompt</label>
+  <textarea id="prompt" placeholder="What is machine learning?"></textarea>
+
+  <button id="askBtn" type="button">Ask the ensemble</button>
+
+  <div id="result"></div>
+
+<script>
+async function signup() {
+  const email = document.getElementById('email').value.trim();
+  if (!email) { alert('Enter your email first.'); return; }
+  const res = await fetch('/auth/signup', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({email})
+  });
+  const data = await res.json();
+  if (data.api_key) {
+    document.getElementById('apikey').value = data.api_key;
+    alert('API key created and filled in below. You are on the free tier.');
+  } else {
+    alert('Signup: ' + (data.error || 'unknown error'));
+  }
+}
+
+async function ask() {
+  const apiKey = document.getElementById('apikey').value.trim();
+  const prompt = document.getElementById('prompt').value.trim();
+  const result = document.getElementById('result');
+  if (!apiKey) { alert('Enter your API key first.'); return; }
+  if (!prompt) { alert('Type a prompt first.'); return; }
+  result.style.display = 'block';
+  result.textContent = 'Thinking... (models can take a while on the free plan)';
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-API-Key': apiKey},
+      body: JSON.stringify({prompt})
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      result.textContent = 'Error: ' + (data.error || res.statusText);
+      return;
+    }
+    result.innerHTML = '';
+    const answer = document.createElement('div');
+    answer.textContent = data.answer;
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.textContent = 'Strategy: ' + data.strategy +
+      ' | Usage: ' + data.usage.requests_this_month + '/' + data.usage.limit + ' this month';
+    result.appendChild(answer);
+    result.appendChild(meta);
+  } catch (e) {
+    result.textContent = 'Network error: ' + e.message;
+  }
+}
+
+document.getElementById('signupBtn').addEventListener('click', signup);
+document.getElementById('askBtn').addEventListener('click', ask);
+</script>
+</body>
+</html>
+    """
+
+@app.route("/success", methods=["GET"])
+def success():
+    """Checkout success page"""
+    session_id = request.args.get("session_id", "")
+    return f"""
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Subscription successful</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 3rem auto; padding: 0 1rem;">
+  <h1>You're subscribed!</h1>
+  <p>Thanks — your payment went through and your plan is being activated. It can take a minute for the upgrade to show on your account.</p>
+  <p>Your new limits apply to the API key tied to the email you checked out with.</p>
+  <p><a href="/demo">Try the demo</a> &middot; <a href="/docs">API docs</a></p>
+  <p style="color:#888; font-size:0.8rem;">Checkout session: {session_id}</p>
+</body>
+</html>
+    """
+
+@app.route("/cancel", methods=["GET"])
+def cancel():
+    """Checkout cancelled page"""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Checkout cancelled</title></head>
+<body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 3rem auto; padding: 0 1rem;">
+  <h1>Checkout cancelled</h1>
+  <p>No worries — nothing was charged. You're still on the free tier (100 requests/month).</p>
+  <p><a href="/pricing">See plans</a> &middot; <a href="/demo">Try the demo</a></p>
+</body>
+</html>
+    """
 
 @app.route("/pricing", methods=["GET"])
 def pricing():
@@ -253,7 +550,7 @@ def pricing():
 def docs():
     """API documentation"""
     return jsonify({
-        "title": "Ensemble Chat API Documentation",
+        "title": "Atlas Chat API Documentation",
         "endpoints": {
             "POST /auth/signup": "Create new account",
             "POST /auth/login": "Get API key",
@@ -275,12 +572,12 @@ def signup():
     """Create new user account"""
     data = request.json
     email = data.get("email")
-    
+
     if not email:
         return jsonify({"error": "Email required"}), 400
-    
+
     api_key = generate_api_key(email)
-    
+
     try:
         conn = sqlite3.connect("ensemble_chat.db")
         c = conn.cursor()
@@ -289,7 +586,7 @@ def signup():
         conn.commit()
         user_id = c.lastrowid
         conn.close()
-        
+
         return jsonify({
             "success": True,
             "email": email,
@@ -297,7 +594,7 @@ def signup():
             "tier": "free",
             "message": "Account created! Use your API key to make requests."
         }), 201
-    
+
     except sqlite3.IntegrityError:
         return jsonify({"error": "Email already exists"}), 400
 
@@ -306,16 +603,16 @@ def login():
     """Login and get API key"""
     data = request.json
     email = data.get("email")
-    
+
     conn = sqlite3.connect("ensemble_chat.db")
     c = conn.cursor()
     c.execute("SELECT api_key, tier FROM users WHERE email=?", (email,))
     result = c.fetchone()
     conn.close()
-    
+
     if not result:
         return jsonify({"error": "User not found"}), 404
-    
+
     api_key, tier = result
     return jsonify({
         "email": email,
@@ -330,21 +627,21 @@ def chat():
     """Chat with ensemble chatbot"""
     data = request.json
     prompt = data.get("prompt")
-    
+
     if not prompt:
         return jsonify({"error": "Prompt required"}), 400
-    
+
     # Get ensemble response
     response = ask_ensemble(prompt)
-    
+
     if "error" in response:
         return jsonify(response), 500
-    
+
     # Increment usage
     increment_usage(request.user_id)
     usage = get_user_usage(request.user_id)
     limit = PRICING_TIERS[request.tier]["requests_per_month"]
-    
+
     return jsonify({
         "prompt": prompt,
         "answer": response["answer"],
@@ -363,7 +660,7 @@ def usage():
     usage_count = get_user_usage(request.user_id)
     tier = request.tier
     limit = PRICING_TIERS[tier]["requests_per_month"]
-    
+
     return jsonify({
         "tier": tier,
         "requests_this_month": usage_count,
@@ -379,21 +676,21 @@ def upgrade():
     data = request.json
     email = data.get("email")
     tier = data.get("tier")  # "starter" or "pro"
-    
+
     if tier not in ["starter", "pro"]:
         return jsonify({"error": "Invalid tier"}), 400
-    
+
     conn = sqlite3.connect("ensemble_chat.db")
     c = conn.cursor()
     c.execute("SELECT id, stripe_customer_id FROM users WHERE email=?", (email,))
     result = c.fetchone()
     conn.close()
-    
+
     if not result:
         return jsonify({"error": "User not found"}), 404
-    
+
     user_id, stripe_customer_id = result
-    
+
     try:
         # Create Stripe checkout session
         session_obj = stripe.checkout.Session.create(
@@ -403,18 +700,18 @@ def upgrade():
                 "quantity": 1,
             }],
             mode="subscription",
-            success_url="https://yourdomain.com/success?session_id={CHECKOUT_SESSION_ID}",
-            cancel_url="https://yourdomain.com/cancel",
+            success_url="https://ensemble-chat.onrender.com/success?session_id={CHECKOUT_SESSION_ID}",
+            cancel_url="https://ensemble-chat.onrender.com/cancel",
             customer=stripe_customer_id or None,
             customer_email=email if not stripe_customer_id else None,
             metadata={"tier": tier, "email": email},
         )
-        
+
         return jsonify({
             "checkout_url": session_obj.url,
             "session_id": session_obj.id
         })
-    
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -423,7 +720,7 @@ def stripe_webhook():
     """Handle Stripe webhook events"""
     payload = request.get_data()
     sig_header = request.headers.get("Stripe-Signature")
-    
+
     try:
         event = stripe.Webhook.construct_event(
             payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET")
@@ -432,7 +729,7 @@ def stripe_webhook():
         return jsonify({"error": "Invalid payload"}), 400
     except stripe.error.SignatureVerificationError:
         return jsonify({"error": "Invalid signature"}), 400
-    
+
     # Handle subscription events
     if event["type"] == "checkout.session.completed":
         session_obj = event["data"]["object"]
@@ -488,6 +785,8 @@ def not_found(error):
 def server_error(error):
     return jsonify({"error": "Internal server error"}), 500
 
+# Initialize database on startup (works under gunicorn too, not just __main__)
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     app.run(debug=True, host="0.0.0.0", port=5000)

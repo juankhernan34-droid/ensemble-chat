@@ -1,0 +1,23 @@
+# Render free-tier blueprint for ensemble-chat
+# Usage: in Render dashboard -> New -> Blueprint -> paste repo URL,
+# or New -> Web Service -> Docker -> connect juankhernan34-droid/ensemble-chat.
+# Set the env vars below manually (values stay with Klen, never committed).
+
+services:
+  - type: web
+    name: ensemble-chat
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    # Render assigns the public port via the $PORT env var.
+    # The repo Dockerfile currently hard-codes 7860, so apply the one-line
+    # CMD change from RENDER_DEPLOY.md before deploying.
+    envVars:
+      - key: HUGGINGFACE_TOKEN
+        sync: false # paste the working Write token in the dashboard
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: FLASK_SECRET_KEY
+        generateValue: true
