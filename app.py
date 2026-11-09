@@ -148,7 +148,11 @@ def load_models():
         client = InferenceClient(token=hf_token)
 
     if os.getenv("GROQ_API_KEY"):
-        # Groq free-tier models (OpenAI-compatible, no card required)
+        # Groq free-tier models (OpenAI-compatible, no card required).
+        # Verified 2026-11-09 against console.groq.com/docs/models: these
+        # are the two strongest self-serve production chat models on Groq.
+        # Llama 3.3 70B is Enterprise-only and Qwen 3.8-27B is preview-only
+        # (not for production), so they are deliberately not used here.
         MODEL_A = "openai/gpt-oss-20b"
         MODEL_B = "openai/gpt-oss-120b"
     else:
@@ -244,9 +248,19 @@ def call_gen(client, model_id, prompt, max_new_tokens=180):
     return text.strip()
 
 def safe_call_gen(client, model_id, prompt, max_new_tokens=180):
-    """Call one model, returning error string instead of raising"""
+    """Call one model, returning error string instead of raising.
+
+    Retries once when the model returns an empty reply (free-tier
+    flakiness: Groq sometimes returns empty content). If the retry is
+    also empty, the empty string is returned and the caller reports the
+    usual "All models failed" error.
+    """
     try:
-        return call_gen(client, model_id, prompt, max_new_tokens)
+        text = call_gen(client, model_id, prompt, max_new_tokens)
+        if not text:
+            # Empty reply: retry once before giving up.
+            text = call_gen(client, model_id, prompt, max_new_tokens)
+        return text
     except Exception as e:
         # Don't leak tokens; HF errors are safe to surface
         # Include response body for HTTP errors to aid debugging
@@ -428,7 +442,7 @@ def demo():
 </head>
 <body>
   <h1>Atlas Chat - Demo</h1>
-  <p class="sub">Ask Mistral &amp; Falcon together. Free tier: 100 requests/month.</p>
+  <p class="sub">Ask GPT-OSS 120B &amp; GPT-OSS 20B together. Free tier: 100 requests/month.</p>
 
   <div class="row">
     <div class="grow">
