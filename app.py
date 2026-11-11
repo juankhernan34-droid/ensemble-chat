@@ -43,8 +43,8 @@ STRIPE_PUBLISHABLE_KEY = os.getenv("STRIPE_PUBLISHABLE_KEY")
 # Pricing tiers
 PRICING_TIERS = {
     "free": {"name": "Free", "price": 0, "requests_per_month": 100, "stripe_price_id": None},
-    "starter": {"name": "Starter", "price": 4.99, "requests_per_month": 5000, "stripe_price_id": os.getenv("STRIPE_STARTER_PRICE_ID")},
-    "pro": {"name": "Pro", "price": 14.99, "requests_per_month": 50000, "stripe_price_id": os.getenv("STRIPE_PRO_PRICE_ID")},
+    "starter": {"name": "Starter", "price": 2.99, "requests_per_month": 5000, "stripe_price_id": os.getenv("STRIPE_STARTER_PRICE_ID")},
+    "pro": {"name": "Pro", "price": 9.99, "requests_per_month": 50000, "stripe_price_id": os.getenv("STRIPE_PRO_PRICE_ID")},
 }
 
 # Database initialization
@@ -376,7 +376,7 @@ def index():
       <li><strong>Ensemble intelligence</strong> — two models vote on the best answer</li>
       <li><strong>Simple API</strong> — one POST request, JSON in and out</li>
       <li><strong>Free tier</strong> — 100 requests/month, no credit card</li>
-      <li><strong>Paid plans</strong> — Starter $4.99/mo, Pro $14.99/mo</li>
+      <li><strong>Paid plans</strong> — Starter $2.99/mo, Pro $9.99/mo</li>
     </ul>
   </div>
   <footer>Atlas Chat API &middot; <a href="/docs">Docs</a> &middot; <a href="/pricing">Pricing</a></footer>
