@@ -15,6 +15,7 @@ mistralai/Mistral-7B-Instruct-v0.1 on huggingface.co while logged in.
 import os
 import json
 import hashlib
+import html
 from datetime import datetime, timedelta
 from functools import wraps
 import sqlite3
@@ -370,6 +371,7 @@ def index():
   <a class="cta cta-primary" href="/demo">Try the Live Demo</a>
   <a class="cta cta-secondary" href="/docs">API Docs</a>
   <a class="cta cta-secondary" href="/pricing">Pricing</a>
+  <a class="cta cta-secondary" href="/menu">Vern's Pizza Menu</a>
   <div class="features">
     <h2>Why Atlas Chat?</h2>
     <ul>
@@ -379,10 +381,163 @@ def index():
       <li><strong>Paid plans</strong> — Starter $2.99/mo, Pro $9.99/mo</li>
     </ul>
   </div>
-  <footer>Atlas Chat API &middot; <a href="/docs">Docs</a> &middot; <a href="/pricing">Pricing</a></footer>
+  <footer>Atlas Chat API &middot; <a href="/docs">Docs</a> &middot; <a href="/pricing">Pricing</a> &middot; <a href="/menu">Vern's Pizza Menu</a></footer>
 </body>
 </html>
     """
+
+# Vern's Pizza menu (display only — no ordering, cart, or checkout)
+_MENU_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verns_menu.json")
+_MENU_CACHE = None
+
+
+def load_menu():
+    """Load the Vern's Pizza menu JSON (cached after first read)"""
+    global _MENU_CACHE
+    if _MENU_CACHE is None:
+        try:
+            with open(_MENU_PATH, "r", encoding="utf-8") as f:
+                _MENU_CACHE = json.load(f)
+        except Exception:
+            _MENU_CACHE = {}
+    return _MENU_CACHE
+
+
+def _money(value):
+    """Format a price as $X.XX, or a dash when that size is not offered"""
+    if value is None:
+        return "&mdash;"
+    return f"${value:.2f}"
+
+
+def _size_label(key):
+    """Human-readable label for a price-map key (reg/lg/each/12in/3/5/8...)"""
+    if key == "reg":
+        return "Reg"
+    if key == "lg":
+        return "Lg"
+    if key == "each":
+        return "Each"
+    if key.endswith("in"):
+        return f'{key[:-2]}"'
+    return f"{key} pc"
+
+
+def _price_text(price):
+    """Render a price that is a number or a {size: price} map"""
+    if isinstance(price, dict):
+        def sort_key(kv):
+            k = kv[0]
+            if k in ("reg", "each"):
+                return (0, k)
+            if k == "lg":
+                return (1, k)
+            if k.endswith("in"):
+                return (2, int(k[:-2]))
+            return (3, int(k))
+        parts = [f"{_size_label(k)} {_money(v)}" for k, v in sorted(price.items(), key=sort_key)]
+        return " / ".join(parts)
+    return _money(price)
+
+
+def _pizza_table(pizzas):
+    """Render one pizza category as a table with Original Thick / Vern's Lite prices"""
+    rows = []
+    for p in pizzas:
+        thick = " / ".join(_money(p["original_thick"].get(s)) for s in ("10", "12", "15", "18"))
+        lite = " / ".join(_money(p["verns_lite"].get(s)) for s in ("10", "12", "15"))
+        rows.append(
+            f"<tr><td><strong>{html.escape(p['name'])}</strong><br>"
+            f"<span class=\"tops\">{html.escape(p['toppings'])}</span></td>"
+            f"<td class=\"price\">{thick}</td><td class=\"price\">{lite}</td></tr>"
+        )
+    return (
+        "<div class=\"tbl-wrap\"><table><thead><tr><th>Pizza</th>"
+        "<th>Original Thick<br><span class=\"sz\">10&Prime; / 12&Prime; / 15&Prime; / 18&Prime;</span></th>"
+        "<th>Vern&rsquo;s Lite<br><span class=\"sz\">10&Prime; / 12&Prime; / 15&Prime;</span></th>"
+        "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>"
+    )
+
+
+def _simple_list(items):
+    """Render a list of {name, price, note?, items?} as name — price rows"""
+    rows = []
+    for it in items:
+        line = f"<strong>{html.escape(it['name'])}</strong>"
+        if it.get("items"):
+            line += f"<br><span class=\"tops\">{html.escape(it['items'])}</span>"
+        if it.get("note"):
+            line += f"<br><span class=\"tops\">{html.escape(it['note'])}</span>"
+        rows.append(f"<li><span>{line}</span><span class=\"price\">{_price_text(it['price'])}</span></li>")
+    return "<ul class=\"menu-list\">" + "".join(rows) + "</ul>"
+
+
+@app.route("/menu", methods=["GET"])
+def menu():
+    """Vern's Pizza menu page (display only — no ordering or checkout)"""
+    log_visit("/menu")
+    m = load_menu()
+    if not m:
+        return "Menu is unavailable right now. Please try again later.", 503
+    store = m["store"]
+    hours = store["hours"]
+    sizes = m["sizes"]
+    ot_legend = " &middot; ".join(f'{s}&Prime; ({html.escape(v)})' for s, v in sizes["original_thick"].items())
+    vl_legend = " &middot; ".join(f'{s}&Prime; ({html.escape(v)})' for s, v in sizes["verns_lite"].items())
+    phone_digits = store["phone"].replace("-", "").replace(" ", "")
+    body = (
+        "<h1>Vern&rsquo;s Pizza &mdash; Menu</h1>"
+        f"<p class=\"store\">{html.escape(store['name'])} &middot; {html.escape(store['address'])}<br>"
+        f"Phone: <a href=\"tel:{phone_digits}\">{html.escape(store['phone'])}</a> &middot; "
+        f"Order online: <a href=\"https://{html.escape(store['order_online'])}\">{html.escape(store['order_online'])}</a></p>"
+        "<p class=\"hours\">"
+        f"Mon&ndash;Tue: {html.escape(hours['mon_tue'])}<br>"
+        f"Wed&ndash;Sat: {html.escape(hours['wed_sat'])}<br>"
+        f"Sun &amp; Holidays: {html.escape(hours['sun_holidays'])}</p>"
+        f"<p>{html.escape(store['notes'])}</p>"
+        "<h2>Pizza sizes</h2>"
+        f"<p><strong>Original Thick:</strong> {ot_legend}<br>"
+        f"<strong>Vern&rsquo;s Lite:</strong> {vl_legend}</p>"
+        f"<p>{html.escape(m['customize_note'])}</p>"
+        "<h2>Traditional Pizzas</h2>" + _pizza_table(m["pizzas"]["traditional"]) +
+        "<h2>Gourmet Pizzas</h2>" + _pizza_table(m["pizzas"]["gourmet"]) +
+        "<h2>Classic Pizzas</h2>" + _pizza_table(m["pizzas"]["classic"]) +
+        "<h2>Snacks &amp; Appetizers</h2>" + _simple_list(m["snacks_appetizers"]) +
+        "<h2>Combos</h2>" + _simple_list(m["combos"]) +
+        "<h2>Salads</h2>" + _simple_list(m["salads"]) +
+        "<h2>Lasagna</h2>" + _simple_list(m["lasagna"]) +
+        "<h2>Desserts</h2>" + _simple_list(m["desserts"]) +
+        f"<h2>Beverages</h2><p>{html.escape(m['beverages'])}</p>"
+    )
+    return (
+        "<!DOCTYPE html>\n"
+        "<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "<title>Vern&rsquo;s Pizza Menu &mdash; Atlas Chat</title>\n"
+        "<meta name=\"description\" content=\"Vern&rsquo;s Pizza menu in Calgary: traditional, gourmet and classic pizzas, snacks, combos, salads, lasagna and desserts. 575 28th Street S.E., 403-508-0220.\">\n"
+        "<style>\n"
+        "  body { font-family: system-ui, sans-serif; max-width: 700px; margin: 3rem auto; padding: 0 1.5rem; line-height: 1.6; color: #1a1a1a; }\n"
+        "  h1 { font-size: 2rem; margin-bottom: 0.25rem; }\n"
+        "  h2 { margin-top: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 0.25rem; }\n"
+        "  a { color: #1a73e8; }\n"
+        "  .store { font-size: 1.05rem; }\n"
+        "  .hours { color: #444; }\n"
+        "  .tbl-wrap { overflow-x: auto; }\n"
+        "  table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }\n"
+        "  th, td { text-align: left; padding: 0.45rem 0.4rem; border-bottom: 1px solid #eee; vertical-align: top; }\n"
+        "  th { white-space: nowrap; }\n"
+        "  .sz { font-weight: normal; font-size: 0.8rem; color: #666; }\n"
+        "  .tops { color: #555; font-size: 0.85rem; }\n"
+        "  .price { white-space: nowrap; }\n"
+        "  .menu-list { list-style: none; padding: 0; }\n"
+        "  .menu-list li { display: flex; justify-content: space-between; gap: 1rem; padding: 0.45rem 0; border-bottom: 1px solid #eee; }\n"
+        "  footer { margin-top: 3rem; font-size: 0.85rem; color: #888; }\n"
+        "</style>\n</head>\n<body>\n"
+        + body +
+        "\n  <footer>Atlas Chat &middot; <a href=\"/\">Home</a> &middot; <a href=\"/demo\">Demo</a> &middot; <a href=\"/pricing\">Pricing</a><br>"
+        "Menu reproduced with permission from Vern&rsquo;s Pizza, Calgary.</footer>\n"
+        "</body>\n</html>\n"
+    )
 
 @app.route("/robots.txt", methods=["GET"])
 def robots():
@@ -398,6 +553,7 @@ def sitemap():
   <url><loc>https://ensemble-chat.onrender.com/demo</loc><priority>0.9</priority></url>
   <url><loc>https://ensemble-chat.onrender.com/docs</loc><priority>0.7</priority></url>
   <url><loc>https://ensemble-chat.onrender.com/pricing</loc><priority>0.7</priority></url>
+  <url><loc>https://ensemble-chat.onrender.com/menu</loc><priority>0.7</priority></url>
 </urlset>
 """, 200, {"Content-Type": "application/xml"}
 
