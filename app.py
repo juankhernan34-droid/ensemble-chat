@@ -1306,12 +1306,13 @@ def kitchen():
                     f"<button class=\"kbtn kbtn-picked\" data-order=\"{html.escape(o['order_number'])}\" "
                     "data-status=\"picked_up\">Picked Up</button>"
                 )
+            phone_digits = re.sub(r"\D", "", o["customer_phone"])
             cards += (
                 "<div class=\"order-card\">"
                 f"<div><span class=\"num\">{html.escape(o['order_number'])}</span> "
                 f"<span class=\"badge badge-{status}\">{badge}</span></div>"
                 f"<div><strong>{html.escape(o['customer_name'])}</strong> &middot; "
-                f"<a href=\"tel:{html.escape(re.sub(r'\D', '', o['customer_phone']))}\">"
+                f"<a href=\"tel:{html.escape(phone_digits)}\">"
                 f"{html.escape(o['customer_phone'])}</a></div>"
                 f"<div>Pickup: {when}</div>"
                 f"<ul>{items}</ul>"
