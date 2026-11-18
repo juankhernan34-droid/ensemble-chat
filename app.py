@@ -14,9 +14,11 @@ mistralai/Mistral-7B-Instruct-v0.1 on huggingface.co while logged in.
 
 import os
 import json
+import re
 import hashlib
 import html
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from functools import wraps
 import sqlite3
 
@@ -98,6 +100,43 @@ def init_db():
             id INTEGER PRIMARY KEY,
             path TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Vern's Pizza pickup orders (pay at the store — no payment data anywhere)
+    # order_type / delivery_address / delivery_fee are for a later delivery
+    # build; v1 is pickup only (order_type is always 'pickup', fee is 0).
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY,
+            order_number TEXT UNIQUE,
+            order_date TEXT,
+            customer_name TEXT,
+            customer_phone TEXT,
+            pickup_type TEXT,
+            pickup_time TEXT,
+            items_json TEXT,
+            subtotal REAL,
+            status TEXT,
+            order_type TEXT DEFAULT 'pickup',
+            delivery_address TEXT,
+            delivery_fee REAL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # One row per ordered line, for the kitchen view
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS order_items (
+            id INTEGER PRIMARY KEY,
+            order_id INTEGER,
+            category TEXT,
+            name TEXT,
+            detail TEXT,
+            unit_price REAL,
+            quantity INTEGER,
+            line_total REAL,
+            FOREIGN KEY(order_id) REFERENCES orders(id)
         )
     """)
 
@@ -372,6 +411,7 @@ def index():
   <a class="cta cta-secondary" href="/docs">API Docs</a>
   <a class="cta cta-secondary" href="/pricing">Pricing</a>
   <a class="cta cta-secondary" href="/menu">Vern's Pizza Menu</a>
+  <a class="cta cta-secondary" href="/order">Order Pickup — Vern's Pizza</a>
   <div class="features">
     <h2>Why Atlas Chat?</h2>
     <ul>
@@ -381,7 +421,7 @@ def index():
       <li><strong>Paid plans</strong> — Starter $2.99/mo, Pro $9.99/mo</li>
     </ul>
   </div>
-  <footer>Atlas Chat API &middot; <a href="/docs">Docs</a> &middot; <a href="/pricing">Pricing</a> &middot; <a href="/menu">Vern's Pizza Menu</a></footer>
+  <footer>Atlas Chat API &middot; <a href="/docs">Docs</a> &middot; <a href="/pricing">Pricing</a> &middot; <a href="/menu">Vern's Pizza Menu</a> &middot; <a href="/order">Order Pickup</a></footer>
 </body>
 </html>
     """
@@ -490,6 +530,7 @@ def menu():
         f"<p class=\"store\">{html.escape(store['name'])} &middot; {html.escape(store['address'])}<br>"
         f"Phone: <a href=\"tel:{phone_digits}\">{html.escape(store['phone'])}</a> &middot; "
         f"Order online: <a href=\"https://{html.escape(store['order_online'])}\">{html.escape(store['order_online'])}</a></p>"
+        "<p><a class=\"order-btn\" href=\"/order\">Order for Pickup &mdash; pay at the store</a></p>"
         "<p class=\"hours\">"
         f"Mon&ndash;Tue: {html.escape(hours['mon_tue'])}<br>"
         f"Wed&ndash;Sat: {html.escape(hours['wed_sat'])}<br>"
@@ -508,6 +549,7 @@ def menu():
         "<h2>Lasagna</h2>" + _simple_list(m["lasagna"]) +
         "<h2>Desserts</h2>" + _simple_list(m["desserts"]) +
         f"<h2>Beverages</h2><p>{html.escape(m['beverages'])}</p>"
+        "<p><a class=\"order-btn\" href=\"/order\">Order for Pickup &mdash; pay at the store</a></p>"
     )
     return (
         "<!DOCTYPE html>\n"
@@ -531,6 +573,7 @@ def menu():
         "  .price { white-space: nowrap; }\n"
         "  .menu-list { list-style: none; padding: 0; }\n"
         "  .menu-list li { display: flex; justify-content: space-between; gap: 1rem; padding: 0.45rem 0; border-bottom: 1px solid #eee; }\n"
+        "  .order-btn { display: inline-block; padding: 0.7rem 1.4rem; font-size: 1.05rem; font-weight: 700; background: #1a73e8; color: #fff !important; text-decoration: none; border-radius: 8px; }\n"
         "  footer { margin-top: 3rem; font-size: 0.85rem; color: #888; }\n"
         "</style>\n</head>\n<body>\n"
         + body +
@@ -538,6 +581,795 @@ def menu():
         "Menu reproduced with permission from Vern&rsquo;s Pizza, Calgary.</footer>\n"
         "</body>\n</html>\n"
     )
+
+# ---------------------------------------------------------------------------
+# Vern's Pizza pickup ordering — pay at the store, no payment code anywhere.
+# Prices are always recomputed server-side from verns_menu.json; anything the
+# customer's browser sends as a total is ignored.
+# Honest limit: orders live in the local SQLite file, which Render's free
+# plan wipes on redeploy/restart. An order's useful life is hours (placed
+# today, picked up today) — the kitchen page is the source of truth during
+# the day, not the database. Do not promise orders are kept forever.
+# ---------------------------------------------------------------------------
+
+_CALGARY_TZ = ZoneInfo("America/Edmonton")
+
+# Store hours, from verns_menu.json (store.hours):
+# Mon-Tue 10AM-10PM, Wed-Sat 10AM-11PM, Sun 11AM-10PM (holidays: Sunday hours)
+_STORE_HOURS = {
+    0: (10, 22),  # Monday
+    1: (10, 22),  # Tuesday
+    2: (10, 23),  # Wednesday
+    3: (10, 23),  # Thursday
+    4: (10, 23),  # Friday
+    5: (10, 23),  # Saturday
+    6: (11, 22),  # Sunday
+}
+# The kitchen needs at least 45 minutes; the app quotes "45 minutes to an hour"
+_PICKUP_LEAD_MINUTES = 45
+
+# Shared kitchen access code, set as an env var in Render (KITCHEN_CODE).
+# No default code — if it is not set, the kitchen page says so instead of
+# letting anyone in.
+KITCHEN_CODE = os.getenv("KITCHEN_CODE")
+
+
+def _calgary_now():
+    """Current time in Calgary (America/Edmonton)"""
+    return datetime.now(_CALGARY_TZ)
+
+
+def _store_hours_today(now=None):
+    """(open, close) datetimes for the store today, Calgary time"""
+    now = now or _calgary_now()
+    open_h, close_h = _STORE_HOURS[now.weekday()]
+    open_dt = now.replace(hour=open_h, minute=0, second=0, microsecond=0)
+    close_dt = now.replace(hour=close_h, minute=0, second=0, microsecond=0)
+    return open_dt, close_dt
+
+
+def _clock_label(hhmm):
+    """'18:00' -> '6:00 PM'"""
+    try:
+        h, m = (int(x) for x in hhmm.split(":"))
+    except Exception:
+        return hhmm
+    ampm = "AM" if h < 12 else "PM"
+    h12 = h % 12 or 12
+    return f"{h12}:{m:02d} {ampm}"
+
+
+def _pickup_slots(now=None):
+    """15-minute pickup slots today, from now+45min up to closing time"""
+    now = now or _calgary_now()
+    open_dt, close_dt = _store_hours_today(now)
+    earliest = now + timedelta(minutes=_PICKUP_LEAD_MINUTES)
+    minutes = earliest.minute
+    rounded = earliest.replace(minute=0, second=0, microsecond=0) + timedelta(
+        minutes=((minutes + 14) // 15) * 15
+    )
+    slots = []
+    t = max(rounded, open_dt)
+    while t <= close_dt:
+        slots.append(t.strftime("%H:%M"))
+        t += timedelta(minutes=15)
+    return slots
+
+
+def _asap_available(now=None):
+    """ASAP works only if the order can be ready before closing"""
+    now = now or _calgary_now()
+    _, close_dt = _store_hours_today(now)
+    return now + timedelta(minutes=_PICKUP_LEAD_MINUTES) <= close_dt
+
+
+_PIZZA_GROUPS = ("traditional", "gourmet", "classic")
+_MENU_SECTIONS = {
+    "snack": "snacks_appetizers",
+    "combo": "combos",
+    "salad": "salads",
+    "lasagna": "lasagna",
+    "dessert": "desserts",
+}
+
+
+def _lookup_price(menu, category, name, variant):
+    """Server-side price authority. Returns (unit_price, detail) or (None, None).
+
+    Pizza variant is 'original_thick:12' or 'verns_lite:15'.
+    Other items: variant is the price-map key ('reg', 'lg', '3', '5', '8',
+    '12in', '15in', 'each') or '' when the price is a single number.
+    """
+    if category == "pizza":
+        try:
+            crust, size = variant.split(":", 1)
+        except (ValueError, AttributeError):
+            return None, None
+        if crust not in ("original_thick", "verns_lite"):
+            return None, None
+        for group in _PIZZA_GROUPS:
+            for p in menu.get("pizzas", {}).get(group, []):
+                if p["name"] == name:
+                    price = p.get(crust, {}).get(size)
+                    if price is None:
+                        return None, None
+                    crust_label = "Original Thick" if crust == "original_thick" else "Vern's Lite"
+                    return price, f'{crust_label} {size}"'
+        return None, None
+    section = _MENU_SECTIONS.get(category)
+    if section is None:
+        return None, None
+    for it in menu.get(section, []):
+        if it["name"] == name:
+            price = it["price"]
+            if isinstance(price, dict):
+                unit = price.get(variant)
+                if unit is None:
+                    return None, None
+                return unit, _size_label(variant)
+            if variant:
+                return None, None
+            return price, ""
+    return None, None
+
+
+def create_order(customer_name, customer_phone, pickup_type, pickup_time, items):
+    """Price the items from verns_menu.json and insert the order + its lines.
+    Returns (order_dict, None) on success, (None, error_message) on failure.
+    The client-sent total (if any) is never used."""
+    menu = load_menu()
+    if not menu:
+        return None, "The menu is unavailable right now."
+    lines = []
+    subtotal = 0.0
+    for item in items:
+        if not isinstance(item, dict):
+            return None, "Invalid item."
+        try:
+            qty = int(item.get("quantity", 0))
+        except (TypeError, ValueError):
+            return None, "Invalid quantity."
+        if qty < 1 or qty > 20:
+            return None, "Quantity must be between 1 and 20."
+        unit, detail = _lookup_price(
+            menu, item.get("category", ""), item.get("name", ""), item.get("variant", "")
+        )
+        if unit is None:
+            return None, f"Sorry, that item is not on the menu: {item.get('name', '')}"
+        lines.append({
+            "category": item["category"],
+            "name": item["name"],
+            "detail": detail,
+            "unit_price": unit,
+            "quantity": qty,
+            "line_total": round(unit * qty, 2),
+        })
+        subtotal += unit * qty
+    if not lines:
+        return None, "Your order is empty."
+    subtotal = round(subtotal, 2)
+    order_date = _calgary_now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect("ensemble_chat.db")
+    try:
+        # Daily order numbers V-001, V-002...; order_number is UNIQUE, so a
+        # same-second collision rolls back and retries with the next number.
+        for _ in range(10):
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM orders WHERE order_date=?", (order_date,))
+            n = (c.fetchone()[0] or 0) + 1
+            number = f"V-{n:03d}"
+            try:
+                c.execute(
+                    "INSERT INTO orders (order_number, order_date, customer_name,"
+                    " customer_phone, pickup_type, pickup_time, items_json, subtotal,"
+                    " status, order_type) VALUES (?,?,?,?,?,?,?,?, 'new', 'pickup')",
+                    (number, order_date, customer_name, customer_phone,
+                     pickup_type, pickup_time, json.dumps(lines), subtotal),
+                )
+                order_id = c.lastrowid
+                for ln in lines:
+                    c.execute(
+                        "INSERT INTO order_items (order_id, category, name, detail,"
+                        " unit_price, quantity, line_total) VALUES (?,?,?,?,?,?,?)",
+                        (order_id, ln["category"], ln["name"], ln["detail"],
+                         ln["unit_price"], ln["quantity"], ln["line_total"]),
+                    )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                continue
+            return {
+                "order_number": number, "order_date": order_date,
+                "customer_name": customer_name, "customer_phone": customer_phone,
+                "pickup_type": pickup_type, "pickup_time": pickup_time,
+                "items": lines, "subtotal": subtotal, "status": "new",
+            }, None
+        return None, "Could not place your order — please try again."
+    finally:
+        conn.close()
+
+
+def get_order(order_number):
+    """One order (with its items) by order number, or None"""
+    conn = sqlite3.connect("ensemble_chat.db")
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM orders WHERE order_number=?", (order_number,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return None
+    order = dict(row)
+    try:
+        order["items"] = json.loads(order["items_json"])
+    except Exception:
+        order["items"] = []
+    return order
+
+
+def get_todays_orders():
+    """Today's orders (Calgary day), newest first"""
+    order_date = _calgary_now().strftime("%Y-%m-%d")
+    conn = sqlite3.connect("ensemble_chat.db")
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM orders WHERE order_date=? ORDER BY id DESC", (order_date,))
+    orders = [dict(r) for r in c.fetchall()]
+    conn.close()
+    for order in orders:
+        try:
+            order["items"] = json.loads(order["items_json"])
+        except Exception:
+            order["items"] = []
+    return orders
+
+
+def update_order_status(order_number, new_status):
+    """new -> ready -> picked_up (new -> picked_up is also allowed).
+    Returns False for unknown orders, bad statuses, or already-picked-up orders."""
+    if new_status not in ("ready", "picked_up"):
+        return False
+    conn = sqlite3.connect("ensemble_chat.db")
+    c = conn.cursor()
+    c.execute("SELECT status FROM orders WHERE order_number=?", (order_number,))
+    row = c.fetchone()
+    if not row or row[0] == "picked_up":
+        conn.close()
+        return False
+    c.execute("UPDATE orders SET status=? WHERE order_number=?", (new_status, order_number))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def _order_page_head(title, extra_css=""):
+    """Shared page shell for the ordering pages (same style as /menu)"""
+    return (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        f"<title>{title} &mdash; Vern&rsquo;s Pizza</title>\n<style>\n"
+        "  body { font-family: system-ui, sans-serif; max-width: 700px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; color: #1a1a1a; }\n"
+        "  h1 { font-size: 1.8rem; margin-bottom: 0.25rem; }\n"
+        "  h2 { margin-top: 2rem; border-bottom: 1px solid #ddd; padding-bottom: 0.25rem; }\n"
+        "  a { color: #1a73e8; }\n"
+        "  .tops { color: #555; font-size: 0.85rem; }\n"
+        "  .price { white-space: nowrap; }\n"
+        "  .item { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; padding: 0.6rem 0; border-bottom: 1px solid #eee; }\n"
+        "  .iname { flex: 1 1 200px; }\n"
+        "  select, input[type=text], input[type=tel] { font-size: 1rem; padding: 0.45rem; box-sizing: border-box; }\n"
+        "  .stepper { display: inline-flex; align-items: center; gap: 0.4rem; }\n"
+        "  .stepper button { width: 2.2rem; height: 2.2rem; font-size: 1.2rem; cursor: pointer; border: 1px solid #ccc; background: #fff; border-radius: 6px; }\n"
+        "  .stepper .qty { min-width: 1.4rem; text-align: center; font-weight: 700; font-size: 1.1rem; }\n"
+        "  .line-total { min-width: 4.2rem; text-align: right; font-weight: 700; }\n"
+        "  .subtotal-bar { position: sticky; bottom: 0; background: #fff; border-top: 2px solid #1a1a1a; padding: 0.8rem 0; display: flex; justify-content: space-between; align-items: center; font-size: 1.2rem; font-weight: 700; }\n"
+        "  .big-btn { display: block; width: 100%; padding: 0.9rem; font-size: 1.15rem; font-weight: 700; background: #1a73e8; color: #fff; border: none; border-radius: 8px; cursor: pointer; margin-top: 1rem; }\n"
+        "  .big-btn:disabled { background: #999; cursor: wait; }\n"
+        "  .order-btn { display: inline-block; padding: 0.7rem 1.4rem; font-size: 1.05rem; font-weight: 700; background: #1a73e8; color: #fff !important; text-decoration: none; border-radius: 8px; }\n"
+        "  label { font-weight: 600; display: block; margin-top: 1rem; }\n"
+        "  label input, label select { display: block; width: 100%; margin-top: 0.25rem; }\n"
+        "  .radio-row { margin-top: 0.5rem; font-weight: 400; }\n"
+        "  .radio-row input { margin-right: 0.4rem; }\n"
+        "  .error { display: none; margin-top: 1rem; padding: 0.8rem; background: #fdecea; border: 1px solid #e57373; border-radius: 8px; color: #7f1d1d; }\n"
+        "  .note { color: #555; font-size: 0.95rem; }\n"
+        "  .big-number { font-size: 2.6rem; font-weight: 800; margin: 0.5rem 0; }\n"
+        "  .pay-note { background: #e8f5e9; border: 1px solid #81c784; border-radius: 8px; padding: 0.9rem; font-size: 1.1rem; font-weight: 700; margin-top: 1rem; }\n"
+        "  .order-card { border: 2px solid #333; border-radius: 10px; padding: 1rem; margin-bottom: 1.2rem; font-size: 1.15rem; }\n"
+        "  .order-card .num { font-size: 1.8rem; font-weight: 800; }\n"
+        "  .badge { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 20px; font-size: 0.9rem; font-weight: 700; }\n"
+        "  .badge-new { background: #fff3cd; color: #664d03; }\n"
+        "  .badge-ready { background: #d1e7dd; color: #0f5132; }\n"
+        "  .badge-picked_up { background: #e2e3e5; color: #41464b; }\n"
+        "  .kbtn { padding: 0.6rem 1.2rem; font-size: 1.05rem; font-weight: 700; border-radius: 8px; border: 1px solid #333; background: #fff; cursor: pointer; margin: 0.3rem 0.3rem 0 0; }\n"
+        "  .kbtn-ready { background: #198754; color: #fff; border-color: #198754; }\n"
+        "  .kbtn-picked { background: #333; color: #fff; }\n"
+        "  footer { margin-top: 3rem; font-size: 0.85rem; color: #888; }\n"
+        + extra_css +
+        "</style>\n</head>\n<body>\n"
+    )
+
+
+def _order_page_foot():
+    return (
+        "\n  <footer>Atlas Chat &middot; <a href=\"/\">Home</a> &middot; <a href=\"/menu\">Menu</a> &middot; <a href=\"/order\">Order for Pickup</a><br>"
+        "Menu reproduced with permission from Vern&rsquo;s Pizza, Calgary.</footer>\n"
+        "</body>\n</html>\n"
+    )
+
+
+def _pizza_variant_options(pizza):
+    """<option> list for one pizza: every crust+size that has a price"""
+    opts = []
+    for crust, label, sizes in (
+        ("original_thick", "Original Thick", ("10", "12", "15", "18")),
+        ("verns_lite", "Vern's Lite", ("10", "12", "15")),
+    ):
+        for size in sizes:
+            price = pizza[crust].get(size)
+            if price is None:
+                continue
+            opts.append(
+                f"<option value=\"{crust}:{size}\" data-price=\"{price:.2f}\">"
+                f"{label} {size}&Prime; &mdash; {_money(price)}</option>"
+            )
+    return "".join(opts)
+
+
+def _variant_options(price):
+    """<option> list for a {size: price} map, in menu order (Reg, Lg, sizes...)"""
+    def sort_key(kv):
+        k = kv[0]
+        if k in ("reg", "each"):
+            return (0, k)
+        if k == "lg":
+            return (1, k)
+        if k.endswith("in"):
+            return (2, int(k[:-2]))
+        return (3, int(k))
+    opts = []
+    for k, v in sorted(price.items(), key=sort_key):
+        opts.append(
+            f"<option value=\"{k}\" data-price=\"{v:.2f}\">"
+            f"{_size_label(k)} &mdash; {_money(v)}</option>"
+        )
+    return "".join(opts)
+
+
+def _order_item_row(category, name, price, note=None, toppings=None, is_pizza=False):
+    """One orderable row: name + variant/size picker + quantity stepper"""
+    line = f"<strong>{html.escape(name)}</strong>"
+    if toppings:
+        line += f"<br><span class=\"tops\">{html.escape(toppings)}</span>"
+    if note:
+        line += f"<br><span class=\"tops\">{html.escape(note)}</span>"
+    if is_pizza:
+        picker = f"<select class=\"variant\" aria-label=\"Crust and size\">{_pizza_variant_options(price)}</select>"
+        data_price = ""
+    elif isinstance(price, dict):
+        picker = f"<select class=\"variant\" aria-label=\"Size\">{_variant_options(price)}</select>"
+        data_price = ""
+    else:
+        picker = f"<span class=\"price\">{_money(price)}</span>"
+        data_price = f" data-price=\"{price:.2f}\""
+    return (
+        f"<div class=\"item\" data-category=\"{category}\" data-name=\"{html.escape(name, quote=True)}\"{data_price}>"
+        f"<div class=\"iname\">{line}</div>{picker}"
+        "<div class=\"stepper\"><button type=\"button\" class=\"minus\" aria-label=\"Remove one\">&minus;</button>"
+        "<span class=\"qty\">0</span>"
+        "<button type=\"button\" class=\"plus\" aria-label=\"Add one\">+</button></div>"
+        "<div class=\"line-total\">$0.00</div></div>"
+    )
+
+
+@app.route("/order", methods=["GET"])
+def order_page():
+    """Pickup order form (phone-first, no account). Closed-hours message outside open hours."""
+    log_visit("/order")
+    m = load_menu()
+    if not m:
+        return "Menu is unavailable right now. Please try again later.", 503
+    store = m["store"]
+    now = _calgary_now()
+    open_dt, close_dt = _store_hours_today(now)
+    slots = _pickup_slots(now)
+    asap_ok = _asap_available(now)
+    phone_digits = store["phone"].replace("-", "").replace(" ", "")
+    if not (open_dt <= now <= close_dt):
+        closed_note = f"We&rsquo;re closed right now &mdash; we open at {_clock_label(open_dt.strftime('%H:%M'))} today."
+    else:
+        # Open, but the kitchen needs 45 minutes and nothing can be ready before closing.
+        closed_note = (f"We&rsquo;re not taking pickup orders any more today &mdash; we close at "
+                       f"{_clock_label(close_dt.strftime('%H:%M'))} and the kitchen needs 45 minutes. "
+                       f"We open again at {_clock_label(open_dt.strftime('%H:%M'))} tomorrow.")
+    if not (open_dt <= now <= close_dt) or (not slots and not asap_ok):
+        return (
+            _order_page_head("Order for Pickup — Vern's Pizza")
+            + "<h1>Order for Pickup</h1>"
+            f"<p>{closed_note}</p>"
+            f"<p>Store hours: Mon&ndash;Tue {html.escape(store['hours']['mon_tue'])}, "
+            f"Wed&ndash;Sat {html.escape(store['hours']['wed_sat'])}, "
+            f"Sun &amp; Holidays {html.escape(store['hours']['sun_holidays'])}.</p>"
+            f"<p>Questions? Call the store: <a href=\"tel:{phone_digits}\">{html.escape(store['phone'])}</a></p>"
+            f"<p><a href=\"/menu\">See the menu</a></p>"
+            + _order_page_foot()
+        )
+    sections = []
+    for group, title in (
+        ("traditional", "Traditional Pizzas"),
+        ("gourmet", "Gourmet Pizzas"),
+        ("classic", "Classic Pizzas"),
+    ):
+        rows = "".join(
+            _order_item_row("pizza", p["name"], p, toppings=p["toppings"], is_pizza=True)
+            for p in m["pizzas"][group]
+        )
+        sections.append(f"<h2>{title}</h2>" + rows)
+    for key, title in (
+        ("snacks_appetizers", "Snacks &amp; Appetizers"),
+        ("combos", "Combos"),
+        ("salads", "Salads"),
+        ("lasagna", "Lasagna"),
+        ("desserts", "Desserts"),
+    ):
+        rows = "".join(
+            _order_item_row(
+                {"snacks_appetizers": "snack", "combos": "combo", "salads": "salad",
+                 "lasagna": "lasagna", "desserts": "dessert"}[key],
+                it["name"], it["price"], note=it.get("note"), toppings=it.get("items"),
+            )
+            for it in m[key]
+        )
+        sections.append(f"<h2>{title}</h2>" + rows)
+    slot_options = "".join(
+        f"<option value=\"{s}\">{_clock_label(s)}</option>" for s in slots
+    )
+    asap_radio = (
+        "<label class=\"radio-row\"><input type=\"radio\" name=\"pickup_type\" value=\"asap\" checked> "
+        "ASAP &mdash; ready in about 45 minutes to an hour</label>"
+        if asap_ok else
+        "<label class=\"radio-row\"><input type=\"radio\" name=\"pickup_type\" value=\"asap\" disabled> "
+        "ASAP &mdash; not available this close to closing</label>"
+    )
+    sched_radio = (
+        "<label class=\"radio-row\"><input type=\"radio\" name=\"pickup_type\" value=\"scheduled\""
+        + ("" if asap_ok else " checked") +
+        "> Pick a time today</label>"
+        f"<select id=\"pickup_time\" style=\"width:100%;margin-top:0.25rem;\">{slot_options}</select>"
+        if slots else
+        "<p class=\"note\">No more pickup times today.</p>"
+    )
+    body = (
+        "<h1>Order for Pickup</h1>"
+        f"<p class=\"store\">{html.escape(store['name'])} &middot; {html.escape(store['address'])}<br>"
+        f"Phone: <a href=\"tel:{phone_digits}\">{html.escape(store['phone'])}</a></p>"
+        "<p class=\"note\">Pick your items, then tell us your name and phone. "
+        "You pay at the store when you pick up &mdash; no payment is taken here. "
+        "Prices are the menu prices; GST is added at the store till.</p>"
+        + "".join(sections) +
+        "<h2>Drinks</h2>"
+        f"<p class=\"note\">Drinks ({html.escape(m['beverages'])}) are available at the store "
+        "&mdash; just ask when you pick up. They are not priced in the app.</p>"
+        "<h2>Your details</h2>"
+        "<form id=\"order-form\">"
+        "<label>Your name<input type=\"text\" id=\"cust_name\" autocomplete=\"name\" required></label>"
+        "<label>Phone number<input type=\"tel\" id=\"cust_phone\" autocomplete=\"tel\" required "
+        "placeholder=\"e.g. 403-555-0123\"></label>"
+        "<label>Pickup time</label>"
+        + asap_radio + sched_radio +
+        "<div class=\"error\" id=\"order-error\"></div>"
+        "<div class=\"subtotal-bar\"><span>Subtotal</span><span id=\"subtotal\">$0.00</span></div>"
+        "<button type=\"submit\" class=\"big-btn\" id=\"place-order\">Place Pickup Order</button>"
+        "<p class=\"note\">Pay at the store when you pick up. GST is added at the store.</p>"
+        "</form>"
+        "<script>\n"
+        "function money(n){ return '$' + n.toFixed(2); }\n"
+        "function rowPrice(row){\n"
+        "  var sel = row.querySelector('select.variant');\n"
+        "  if (sel) { return parseFloat(sel.options[sel.selectedIndex].getAttribute('data-price') || '0'); }\n"
+        "  return parseFloat(row.getAttribute('data-price') || '0');\n"
+        "}\n"
+        "function updateSubtotal(){\n"
+        "  var total = 0;\n"
+        "  document.querySelectorAll('.item').forEach(function(row){\n"
+        "    var qty = parseInt(row.querySelector('.qty').textContent, 10) || 0;\n"
+        "    var line = qty * rowPrice(row);\n"
+        "    row.querySelector('.line-total').textContent = money(line);\n"
+        "    total += line;\n"
+        "  });\n"
+        "  document.getElementById('subtotal').textContent = money(total);\n"
+        "}\n"
+        "document.addEventListener('click', function(e){\n"
+        "  var btn = e.target.closest('.plus, .minus');\n"
+        "  if (!btn) return;\n"
+        "  var qtyEl = btn.parentElement.querySelector('.qty');\n"
+        "  var qty = parseInt(qtyEl.textContent, 10) || 0;\n"
+        "  qty += btn.classList.contains('plus') ? 1 : -1;\n"
+        "  if (qty < 0) qty = 0;\n"
+        "  if (qty > 20) qty = 20;\n"
+        "  qtyEl.textContent = qty;\n"
+        "  updateSubtotal();\n"
+        "});\n"
+        "document.addEventListener('change', function(e){\n"
+        "  if (e.target.classList.contains('variant')) updateSubtotal();\n"
+        "});\n"
+        "document.getElementById('order-form').addEventListener('submit', function(e){\n"
+        "  e.preventDefault();\n"
+        "  var err = document.getElementById('order-error');\n"
+        "  err.style.display = 'none';\n"
+        "  var items = [];\n"
+        "  document.querySelectorAll('.item').forEach(function(row){\n"
+        "    var qty = parseInt(row.querySelector('.qty').textContent, 10) || 0;\n"
+        "    if (qty <= 0) return;\n"
+        "    var sel = row.querySelector('select.variant');\n"
+        "    items.push({category: row.getAttribute('data-category'),\n"
+        "      name: row.getAttribute('data-name'),\n"
+        "      variant: sel ? sel.value : '', quantity: qty});\n"
+        "  });\n"
+        "  var pickupType = document.querySelector('input[name=pickup_type]:checked');\n"
+        "  var pickupTime = '';\n"
+        "  if (pickupType && pickupType.value === 'scheduled') {\n"
+        "    var timeSel = document.getElementById('pickup_time');\n"
+        "    pickupTime = timeSel ? timeSel.value : '';\n"
+        "  }\n"
+        "  var btn = document.getElementById('place-order');\n"
+        "  btn.disabled = true;\n"
+        "  btn.textContent = 'Placing your order...';\n"
+        "  fetch('/api/order', {method: 'POST', headers: {'Content-Type': 'application/json'},\n"
+        "    body: JSON.stringify({name: document.getElementById('cust_name').value,\n"
+        "      phone: document.getElementById('cust_phone').value,\n"
+        "      pickup_type: pickupType ? pickupType.value : 'asap',\n"
+        "      pickup_time: pickupTime, items: items})})\n"
+        "  .then(function(r){ return r.json().then(function(j){ return {status: r.status, body: j}; }); })\n"
+        "  .then(function(res){\n"
+        "    if (res.status === 201) { window.location = '/order/' + res.body.order_number; return; }\n"
+        "    err.textContent = res.body.error || 'Something went wrong. Please try again or call the store.';\n"
+        "    err.style.display = 'block';\n"
+        "    btn.disabled = false;\n"
+        "    btn.textContent = 'Place Pickup Order';\n"
+        "  })\n"
+        "  .catch(function(){\n"
+        "    err.textContent = 'Could not reach the store. Please try again or call the store.';\n"
+        "    err.style.display = 'block';\n"
+        "    btn.disabled = false;\n"
+        "    btn.textContent = 'Place Pickup Order';\n"
+        "  });\n"
+        "});\n"
+        "updateSubtotal();\n"
+        "</script>\n"
+    )
+    return _order_page_head("Order for Pickup — Vern's Pizza") + body + _order_page_foot()
+
+
+@app.route("/api/order", methods=["POST"])
+def api_order():
+    """Create a pickup order. All prices are recomputed server-side from
+    verns_menu.json — any total the browser sends is ignored."""
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    phone = (data.get("phone") or "").strip()
+    pickup_type = data.get("pickup_type") or "asap"
+    pickup_time = (data.get("pickup_time") or "").strip()
+    items = data.get("items") or []
+    if not name:
+        return jsonify({"error": "Please enter your name."}), 400
+    if len(re.sub(r"\D", "", phone)) < 7:
+        return jsonify({"error": "Please enter a phone number we can reach you at."}), 400
+    if not isinstance(items, list) or not items:
+        return jsonify({"error": "Please add at least one item."}), 400
+    now = _calgary_now()
+    open_dt, close_dt = _store_hours_today(now)
+    if not (open_dt <= now <= close_dt):
+        return jsonify({"error": "We're closed right now — please order during open hours."}), 400
+    if pickup_type == "asap":
+        ready = now + timedelta(minutes=_PICKUP_LEAD_MINUTES)
+        if ready > close_dt:
+            return jsonify({"error": "ASAP is no longer available today — please pick a time."}), 400
+        # Store the estimated ready clock time; the confirmation page explains it.
+        pickup_time = ready.strftime("%H:%M")
+    elif pickup_type == "scheduled":
+        if pickup_time not in _pickup_slots(now):
+            return jsonify({"error": "Please pick a valid pickup time today."}), 400
+    else:
+        return jsonify({"error": "Please choose ASAP or a pickup time."}), 400
+    order, err = create_order(name, phone, pickup_type, pickup_time, items)
+    if err:
+        return jsonify({"error": err}), 400
+    log_visit("/order")
+    return jsonify({
+        "order_number": order["order_number"],
+        "pickup_type": pickup_type,
+        "pickup_time": pickup_time,
+        "subtotal": order["subtotal"],
+    }), 201
+
+
+@app.route("/order/<order_number>", methods=["GET"])
+def order_confirmation(order_number):
+    """Confirmation page for one order: number, pickup time, items, subtotal,
+    and the pay-at-the-store note."""
+    order = get_order(order_number)
+    if not order:
+        return (
+            _order_page_head("Order not found — Vern's Pizza")
+            + "<h1>Order not found</h1>"
+            "<p>We could not find that order number. It may have been placed on a "
+            "different day, or the site restarted since it was placed.</p>"
+            "<p>Questions? Call the store: <a href=\"tel:4035080220\">403-508-0220</a></p>"
+            "<p><a href=\"/order\">Place a new order</a></p>"
+            + _order_page_foot()
+        ), 404
+    store = load_menu().get("store", {})
+    store_name = store.get("name", "Vern's Pizza")
+    store_addr = store.get("address", "#127, 575 28th Street S.E., Calgary")
+    store_phone = store.get("phone", "403-508-0220")
+    phone_digits = store_phone.replace("-", "").replace(" ", "")
+    if order["pickup_type"] == "asap":
+        when = (f"ASAP &mdash; ready in about 45 minutes to an hour "
+               f"(around {_clock_label(order['pickup_time'])})")
+    else:
+        when = f"Today at {_clock_label(order['pickup_time'])}"
+    rows = "".join(
+        f"<li><span>{ln['quantity']} &times; {html.escape(ln['name'])}"
+        + (f" &mdash; {html.escape(ln['detail'])}" if ln["detail"] else "")
+        + f"</span><span class=\"price\">{_money(ln['line_total'])}</span></li>"
+        for ln in order["items"]
+    )
+    body = (
+        "<h1>Order placed!</h1>"
+        f"<p>Your order number is:</p><p class=\"big-number\">{html.escape(order['order_number'])}</p>"
+        f"<p><strong>Pickup:</strong> {when}</p>"
+        f"<p><strong>Name:</strong> {html.escape(order['customer_name'])}</p>"
+        "<ul class=\"menu-list\">" + rows + "</ul>"
+        f"<p><strong>Subtotal: {_money(order['subtotal'])}</strong><br>"
+        "<span class=\"note\">GST is added at the store till.</span></p>"
+        "<p class=\"pay-note\">Pay at the store when you pick up &mdash; no payment was taken here.</p>"
+        f"<p>{html.escape(store_name)} &middot; "
+        f"{html.escape(store_addr)}<br>"
+        f"Phone: <a href=\"tel:{phone_digits}\">{html.escape(store_phone)}</a> "
+        "&mdash; call if anything goes wrong with your order.</p>"
+        "<p><a href=\"/menu\">Back to the menu</a></p>"
+    )
+    return _order_page_head(f"Order {html.escape(order['order_number'])} — Vern's Pizza") + body + _order_page_foot()
+
+
+def _kitchen_login_page(error=None):
+    """Access-code gate for the kitchen page"""
+    msg = f"<p class=\"error\" style=\"display:block;\">{html.escape(error)}</p>" if error else ""
+    return (
+        _order_page_head("Kitchen — Vern's Pizza")
+        + "<h1>Kitchen</h1>"
+        + msg +
+        "<p>Enter the kitchen code to see today&rsquo;s orders.</p>"
+        "<form method=\"POST\" action=\"/kitchen\">"
+        "<label>Kitchen code<input type=\"text\" name=\"code\" inputmode=\"numeric\" "
+        "autocomplete=\"off\" required autofocus></label>"
+        "<button type=\"submit\" class=\"big-btn\">Open Kitchen</button></form>"
+        + _order_page_foot()
+    )
+
+
+def _kitchen_token():
+    """Session token proving the code was entered (hash of the code, so a
+    guessed 'true' flag in a forged session cookie is not enough)."""
+    if not KITCHEN_CODE:
+        return None
+    return hashlib.sha256(f"kitchen:{KITCHEN_CODE}".encode()).hexdigest()
+
+
+@app.route("/kitchen", methods=["GET", "POST"])
+def kitchen():
+    """Today's orders for the store, newest first. Big text, auto-refreshes
+    every 30 seconds. Protected by the shared KITCHEN_CODE env var; the code
+    is remembered in a session cookie on that device."""
+    log_visit("/kitchen")
+    if not KITCHEN_CODE:
+        return (
+            _order_page_head("Kitchen — Vern's Pizza")
+            + "<h1>Kitchen</h1>"
+            "<p>The kitchen screen is not set up yet &mdash; the owner needs to set "
+            "the kitchen access code in the app settings first.</p>"
+            + _order_page_foot()
+        ), 503
+    if request.method == "POST":
+        code = (request.form.get("code") or "").strip()
+        if code and code == KITCHEN_CODE:
+            session["kitchen_token"] = _kitchen_token()
+            return redirect(url_for("kitchen"))
+        return _kitchen_login_page("That code did not match. Please try again.")
+    if session.get("kitchen_token") != _kitchen_token():
+        return _kitchen_login_page()
+    orders = get_todays_orders()
+    if not orders:
+        cards = "<p>No orders yet today.</p>"
+    else:
+        cards = ""
+        for o in orders:
+            status = o["status"]
+            badge = {"new": "NEW", "ready": "READY", "picked_up": "PICKED UP"}.get(status, status.upper())
+            if o["pickup_type"] == "asap":
+                when = f"ASAP (ready ~{_clock_label(o['pickup_time'])})"
+            else:
+                when = f"Today at {_clock_label(o['pickup_time'])}"
+            items = "".join(
+                f"<li>{ln['quantity']} &times; {html.escape(ln['name'])}"
+                + (f" &mdash; {html.escape(ln['detail'])}" if ln["detail"] else "")
+                + f" &mdash; {_money(ln['line_total'])}</li>"
+                for ln in o["items"]
+            )
+            buttons = ""
+            if status == "new":
+                buttons = (
+                    f"<button class=\"kbtn kbtn-ready\" data-order=\"{html.escape(o['order_number'])}\" "
+                    "data-status=\"ready\">Ready</button>"
+                )
+            if status in ("new", "ready"):
+                buttons += (
+                    f"<button class=\"kbtn kbtn-picked\" data-order=\"{html.escape(o['order_number'])}\" "
+                    "data-status=\"picked_up\">Picked Up</button>"
+                )
+            cards += (
+                "<div class=\"order-card\">"
+                f"<div><span class=\"num\">{html.escape(o['order_number'])}</span> "
+                f"<span class=\"badge badge-{status}\">{badge}</span></div>"
+                f"<div><strong>{html.escape(o['customer_name'])}</strong> &middot; "
+                f"<a href=\"tel:{html.escape(re.sub(r'\D', '', o['customer_phone']))}\">"
+                f"{html.escape(o['customer_phone'])}</a></div>"
+                f"<div>Pickup: {when}</div>"
+                f"<ul>{items}</ul>"
+                f"<div><strong>Subtotal: {_money(o['subtotal'])}</strong> "
+                "<span class=\"note\">(GST added at the till)</span></div>"
+                f"<div>{buttons}</div></div>"
+            )
+    body = (
+        "<h1>Kitchen &mdash; Today&rsquo;s Orders</h1>"
+        f"<p class=\"note\">This page refreshes itself every 30 seconds. "
+        f"{len(orders)} order(s) today. Orders are kept for today only &mdash; "
+        "the site does not store them forever.</p>"
+        + cards +
+        "<script>\n"
+        "document.addEventListener('click', function(e){\n"
+        "  var btn = e.target.closest('.kbtn');\n"
+        "  if (!btn) return;\n"
+        "  btn.disabled = true;\n"
+        "  fetch('/api/kitchen/status', {method: 'POST', headers: {'Content-Type': 'application/json'},\n"
+        "    body: JSON.stringify({order_number: btn.getAttribute('data-order'),\n"
+        "      status: btn.getAttribute('data-status')})})\n"
+        "  .then(function(){ window.location.reload(); });\n"
+        "});\n"
+        "</script>\n"
+    )
+    return (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "<meta http-equiv=\"refresh\" content=\"30\">\n"
+        "<title>Kitchen &mdash; Vern&rsquo;s Pizza</title>\n"
+        "<style>\n"
+        "  body { font-family: system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; color: #1a1a1a; }\n"
+        "  h1 { font-size: 1.8rem; }\n"
+        "  a { color: #1a73e8; }\n"
+        "  .note { color: #555; font-size: 0.95rem; }\n"
+        "  .order-card { border: 2px solid #333; border-radius: 10px; padding: 1rem; margin-bottom: 1.2rem; font-size: 1.15rem; }\n"
+        "  .order-card .num { font-size: 1.8rem; font-weight: 800; }\n"
+        "  .badge { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 20px; font-size: 0.9rem; font-weight: 700; }\n"
+        "  .badge-new { background: #fff3cd; color: #664d03; }\n"
+        "  .badge-ready { background: #d1e7dd; color: #0f5132; }\n"
+        "  .badge-picked_up { background: #e2e3e5; color: #41464b; }\n"
+        "  .kbtn { padding: 0.6rem 1.2rem; font-size: 1.05rem; font-weight: 700; border-radius: 8px; border: 1px solid #333; background: #fff; cursor: pointer; margin: 0.3rem 0.3rem 0 0; }\n"
+        "  .kbtn-ready { background: #198754; color: #fff; border-color: #198754; }\n"
+        "  .kbtn-picked { background: #333; color: #fff; }\n"
+        "</style>\n</head>\n<body>\n" + body + "\n</body>\n</html>\n"
+    )
+
+
+@app.route("/api/kitchen/status", methods=["POST"])
+def api_kitchen_status():
+    """Mark an order Ready / Picked Up (kitchen session only)"""
+    if not KITCHEN_CODE or session.get("kitchen_token") != _kitchen_token():
+        return jsonify({"error": "Not authorized."}), 401
+    data = request.get_json(silent=True) or {}
+    if not update_order_status(data.get("order_number", ""), data.get("status", "")):
+        return jsonify({"error": "Could not update that order."}), 400
+    return jsonify({"ok": True})
+
 
 @app.route("/robots.txt", methods=["GET"])
 def robots():
@@ -554,6 +1386,7 @@ def sitemap():
   <url><loc>https://ensemble-chat.onrender.com/docs</loc><priority>0.7</priority></url>
   <url><loc>https://ensemble-chat.onrender.com/pricing</loc><priority>0.7</priority></url>
   <url><loc>https://ensemble-chat.onrender.com/menu</loc><priority>0.7</priority></url>
+  <url><loc>https://ensemble-chat.onrender.com/order</loc><priority>0.7</priority></url>
 </urlset>
 """, 200, {"Content-Type": "application/xml"}
 
