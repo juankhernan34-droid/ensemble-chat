@@ -108,10 +108,47 @@ def init_db():
     # Vern's Pizza orders (pay at the store for pickup, by card at the door
     # for delivery — no payment data anywhere). order_type is 'pickup' or
     # 'delivery'; delivery orders carry delivery_address and delivery_fee.
+    # Numbers run per ready day (V-001, V-002... each day), so the number is
+    # only unique together with its date. Older DBs declared order_number
+    # UNIQUE on its own — a pre-order for tomorrow could then never take
+    # V-001 if today already had one, so rebuild the table once if so.
+    row = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='orders'"
+    ).fetchone()
+    if row and "order_number TEXT UNIQUE" in (row[0] or ""):
+        c.execute("ALTER TABLE orders RENAME TO orders_old")
+        c.execute("""
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY,
+                order_number TEXT,
+                order_date TEXT,
+                customer_name TEXT,
+                customer_phone TEXT,
+                pickup_type TEXT,
+                pickup_time TEXT,
+                items_json TEXT,
+                subtotal REAL,
+                status TEXT,
+                order_type TEXT DEFAULT 'pickup',
+                delivery_address TEXT,
+                delivery_fee REAL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(order_number, order_date)
+            )
+        """)
+        c.execute(
+            "INSERT INTO orders (id, order_number, order_date, customer_name,"
+            " customer_phone, pickup_type, pickup_time, items_json, subtotal,"
+            " status, order_type, delivery_address, delivery_fee, created_at)"
+            " SELECT id, order_number, order_date, customer_name, customer_phone,"
+            " pickup_type, pickup_time, items_json, subtotal, status, order_type,"
+            " delivery_address, delivery_fee, created_at FROM orders_old"
+        )
+        c.execute("DROP TABLE orders_old")
     c.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY,
-            order_number TEXT UNIQUE,
+            order_number TEXT,
             order_date TEXT,
             customer_name TEXT,
             customer_phone TEXT,
@@ -123,7 +160,8 @@ def init_db():
             order_type TEXT DEFAULT 'pickup',
             delivery_address TEXT,
             delivery_fee REAL DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(order_number, order_date)
         )
     """)
 
@@ -649,28 +687,92 @@ def _clock_label(hhmm):
     return f"{h12}:{m:02d} {ampm}"
 
 
-def _pickup_slots(now=None):
-    """15-minute pickup slots today, from now+45min up to closing time"""
-    now = now or _calgary_now()
-    open_dt, close_dt = _store_hours_today(now)
-    earliest = now + timedelta(minutes=_PICKUP_LEAD_MINUTES)
+def _day_word(date_str, today_str):
+    """'Today', 'Tomorrow', or the weekday name for a YYYY-MM-DD date,
+    relative to the YYYY-MM-DD day it is being shown on."""
+    if date_str == today_str:
+        return "Today"
+    try:
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+        t = datetime.strptime(today_str, "%Y-%m-%d").date()
+    except ValueError:
+        return ""
+    if (d - t).days == 1:
+        return "Tomorrow"
+    return d.strftime("%A")
+
+
+def _slot_value(t):
+    """A slot datetime as 'YYYY-MM-DD HH:MM' — the date rides along so the
+    server knows which day the slot is on."""
+    return t.strftime("%Y-%m-%d %H:%M")
+
+
+def _slots_for_day(day, earliest):
+    """15-minute slots on `day` (a datetime that day), from `earliest`
+    rounded up to the next 15 minutes, up to closing time."""
+    open_dt, close_dt = _store_hours_today(day)
     minutes = earliest.minute
     rounded = earliest.replace(minute=0, second=0, microsecond=0) + timedelta(
         minutes=((minutes + 14) // 15) * 15
     )
     slots = []
-    t = max(rounded, open_dt)
+    # The kitchen needs 45 minutes from opening, so before opening the
+    # first bookable slot is opening+45min, not opening itself.
+    t = max(rounded, open_dt + timedelta(minutes=_PICKUP_LEAD_MINUTES))
     while t <= close_dt:
-        slots.append(t.strftime("%H:%M"))
+        slots.append(t)
         t += timedelta(minutes=15)
     return slots
 
 
-def _asap_available(now=None):
-    """ASAP works only if the order can be ready before closing"""
+def _pickup_slots(now=None):
+    """Pickup/delivery slots as (value, label) pairs. Today's remaining
+    slots when there are any, otherwise the next open day's full day
+    (opening+45min to closing). Values carry the date ('2026-11-26 10:00');
+    labels name the day ('Today 6:00 PM', 'Tomorrow 10:00 AM')."""
     now = now or _calgary_now()
-    _, close_dt = _store_hours_today(now)
-    return now + timedelta(minutes=_PICKUP_LEAD_MINUTES) <= close_dt
+    today = now.strftime("%Y-%m-%d")
+    slots = _slots_for_day(now, now + timedelta(minutes=_PICKUP_LEAD_MINUTES))
+    if slots:
+        return [(_slot_value(t), "Today " + _clock_label(t.strftime("%H:%M"))) for t in slots]
+    next_day = now + timedelta(days=1)
+    open_dt, _ = _store_hours_today(next_day)
+    slots = _slots_for_day(next_day, open_dt + timedelta(minutes=_PICKUP_LEAD_MINUTES))
+    return [
+        (_slot_value(t), _day_word(t.strftime("%Y-%m-%d"), today) + " " + _clock_label(t.strftime("%H:%M")))
+        for t in slots
+    ]
+
+
+def _asap_ready(now=None):
+    """When the kitchen can have an ASAP order ready. Open now and
+    now+45min before closing: today at now+45min. Before opening: today at
+    opening+45min. After closing (or now+45min past closing): the next open
+    day at opening+45min. There is always a next opening, so ASAP never
+    fails for being too early or too late."""
+    now = now or _calgary_now()
+    open_dt, close_dt = _store_hours_today(now)
+    ready = now + timedelta(minutes=_PICKUP_LEAD_MINUTES)
+    if now < open_dt:
+        return open_dt + timedelta(minutes=_PICKUP_LEAD_MINUTES)
+    if ready <= close_dt:
+        return ready
+    next_day = now + timedelta(days=1)
+    next_open, _ = _store_hours_today(next_day)
+    return next_open + timedelta(minutes=_PICKUP_LEAD_MINUTES)
+
+
+def _next_open_dt(now=None):
+    """Next time the kitchen opens: today's opening if it has not passed,
+    otherwise tomorrow's opening."""
+    now = now or _calgary_now()
+    open_dt, _ = _store_hours_today(now)
+    if now < open_dt:
+        return open_dt
+    next_day = now + timedelta(days=1)
+    next_open, _ = _store_hours_today(next_day)
+    return next_open
 
 
 _PIZZA_GROUPS = ("traditional", "gourmet", "classic")
@@ -724,12 +826,13 @@ def _lookup_price(menu, category, name, variant):
 
 
 def create_order(customer_name, customer_phone, pickup_type, pickup_time, items,
-                 order_type="pickup", delivery_address=""):
+                 order_type="pickup", delivery_address="", order_date=None):
     """Price the items from verns_menu.json and insert the order + its lines.
     Returns (order_dict, None) on success, (None, error_message) on failure.
     The client-sent total (if any) is never used. Delivery orders are charged
     the flat Calgary fee (_DELIVERY_FEE + _CARD_FEE) — recomputed here, never
-    taken from the browser."""
+    taken from the browser. order_date is the READY day (today unless the
+    caller worked out a later ready day); order numbers run per ready day."""
     menu = load_menu()
     if not menu:
         return None, "The menu is unavailable right now."
@@ -767,7 +870,7 @@ def create_order(customer_name, customer_phone, pickup_type, pickup_time, items,
         order_type = "pickup"
         delivery_fee = 0.0
         delivery_address = ""
-    order_date = _calgary_now().strftime("%Y-%m-%d")
+    order_date = order_date or _calgary_now().strftime("%Y-%m-%d")
     conn = sqlite3.connect("ensemble_chat.db")
     try:
         # Daily order numbers V-001, V-002...; order_number is UNIQUE, so a
@@ -814,11 +917,13 @@ def create_order(customer_name, customer_phone, pickup_type, pickup_time, items,
 
 
 def get_order(order_number):
-    """One order (with its items) by order number, or None"""
+    """One order (with its items) by order number, or None. Order numbers
+    repeat each day, so the newest match wins — that is the order just
+    placed, which is what the confirmation page is showing."""
     conn = sqlite3.connect("ensemble_chat.db")
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
-    c.execute("SELECT * FROM orders WHERE order_number=?", (order_number,))
+    c.execute("SELECT * FROM orders WHERE order_number=? ORDER BY id DESC LIMIT 1", (order_number,))
     row = c.fetchone()
     conn.close()
     if not row:
@@ -850,17 +955,21 @@ def get_todays_orders():
 
 def update_order_status(order_number, new_status):
     """new -> ready -> picked_up (new -> picked_up is also allowed).
-    Returns False for unknown orders, bad statuses, or already-picked-up orders."""
+    Returns False for unknown orders, bad statuses, or already-picked-up orders.
+    The kitchen only ever acts on today's orders, so the update is scoped to
+    today's ready day — order numbers repeat each day, and a pre-order for
+    tomorrow must never be touched by today's kitchen screen."""
     if new_status not in ("ready", "picked_up"):
         return False
+    today = _calgary_now().strftime("%Y-%m-%d")
     conn = sqlite3.connect("ensemble_chat.db")
     c = conn.cursor()
-    c.execute("SELECT status FROM orders WHERE order_number=?", (order_number,))
+    c.execute("SELECT status FROM orders WHERE order_number=? AND order_date=?", (order_number, today))
     row = c.fetchone()
     if not row or row[0] == "picked_up":
         conn.close()
         return False
-    c.execute("UPDATE orders SET status=? WHERE order_number=?", (new_status, order_number))
+    c.execute("UPDATE orders SET status=? WHERE order_number=? AND order_date=?", (new_status, order_number, today))
     conn.commit()
     conn.close()
     return True
@@ -986,7 +1095,9 @@ def _order_item_row(category, name, price, note=None, toppings=None, is_pizza=Fa
 
 @app.route("/order", methods=["GET"])
 def order_page():
-    """Pickup or delivery order form (phone-first, no account). Closed-hours message outside open hours."""
+    """Pickup or delivery order form (phone-first, no account). Orders are
+    taken any time — before opening or after closing they are made when the
+    kitchen next opens, so the form never closes."""
     log_visit("/order")
     m = load_menu()
     if not m:
@@ -995,26 +1106,18 @@ def order_page():
     now = _calgary_now()
     open_dt, close_dt = _store_hours_today(now)
     slots = _pickup_slots(now)
-    asap_ok = _asap_available(now)
+    ready_dt = _asap_ready(now)
     phone_digits = store["phone"].replace("-", "").replace(" ", "")
-    if not (open_dt <= now <= close_dt):
-        closed_note = f"We&rsquo;re closed right now &mdash; we open at {_clock_label(open_dt.strftime('%H:%M'))} today."
-    else:
-        # Open, but the kitchen needs 45 minutes and nothing can be ready before closing.
-        closed_note = (f"We&rsquo;re not taking orders any more today &mdash; we close at "
-                       f"{_clock_label(close_dt.strftime('%H:%M'))} and the kitchen needs 45 minutes. "
-                       f"We open again at {_clock_label(open_dt.strftime('%H:%M'))} tomorrow.")
-    if not (open_dt <= now <= close_dt) or (not slots and not asap_ok):
-        return (
-            _order_page_head("Order — Vern's Pizza")
-            + "<h1>Order</h1>"
-            f"<p>{closed_note}</p>"
-            f"<p>Store hours: Mon&ndash;Tue {html.escape(store['hours']['mon_tue'])}, "
+    closed_note = ""
+    if now < open_dt or now > close_dt:
+        next_open = _next_open_dt(now)
+        day_word = "today" if next_open.date() == now.date() else "tomorrow"
+        closed_note = (
+            f"<p class=\"note\">We&rsquo;re closed right now &mdash; orders placed now are made "
+            f"when we open {day_word} at {_clock_label(next_open.strftime('%H:%M'))}.</p>"
+            f"<p class=\"note\">Store hours: Mon&ndash;Tue {html.escape(store['hours']['mon_tue'])}, "
             f"Wed&ndash;Sat {html.escape(store['hours']['wed_sat'])}, "
             f"Sun &amp; Holidays {html.escape(store['hours']['sun_holidays'])}.</p>"
-            f"<p>Questions? Call the store: <a href=\"tel:{phone_digits}\">{html.escape(store['phone'])}</a></p>"
-            f"<p><a href=\"/menu\">See the menu</a></p>"
-            + _order_page_foot()
         )
     sections = []
     for group, title in (
@@ -1044,27 +1147,31 @@ def order_page():
         )
         sections.append(f"<h2>{title}</h2>" + rows)
     slot_options = "".join(
-        f"<option value=\"{s}\">{_clock_label(s)}</option>" for s in slots
+        f"<option value=\"{v}\">{html.escape(label)}</option>" for v, label in slots
     )
+    if open_dt <= now <= close_dt:
+        asap_label = "ASAP &mdash; ready in about 45 minutes to an hour"
+    else:
+        asap_day = _day_word(ready_dt.strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d"))
+        asap_label = (
+            f"ASAP &mdash; ready {asap_day.lower() if asap_day in ('Today', 'Tomorrow') else asap_day} "
+            f"at {_clock_label(ready_dt.strftime('%H:%M'))}"
+        )
     asap_radio = (
         "<label class=\"radio-row\"><input type=\"radio\" name=\"pickup_type\" value=\"asap\" checked> "
-        "ASAP &mdash; ready in about 45 minutes to an hour</label>"
-        if asap_ok else
-        "<label class=\"radio-row\"><input type=\"radio\" name=\"pickup_type\" value=\"asap\" disabled> "
-        "ASAP &mdash; not available this close to closing</label>"
+        + asap_label + "</label>"
     )
+    slots_today = slots[0][0][:10] == now.strftime("%Y-%m-%d")
     sched_radio = (
-        "<label class=\"radio-row\"><input type=\"radio\" name=\"pickup_type\" value=\"scheduled\""
-        + ("" if asap_ok else " checked") +
-        "> Pick a time today</label>"
+        "<label class=\"radio-row\"><input type=\"radio\" name=\"pickup_type\" value=\"scheduled\"> "
+        f"Pick a time {'today' if slots_today else 'tomorrow'}</label>"
         f"<select id=\"pickup_time\" style=\"width:100%;margin-top:0.25rem;\">{slot_options}</select>"
-        if slots else
-        "<p class=\"note\">No more pickup times today.</p>"
     )
     body = (
         "<h1>Order — Pickup or Delivery</h1>"
         f"<p class=\"store\">{html.escape(store['name'])} &middot; {html.escape(store['address'])}<br>"
         f"Phone: <a href=\"tel:{phone_digits}\">{html.escape(store['phone'])}</a></p>"
+        + closed_note +
         "<p class=\"note\">Pick your items, then tell us your name and phone. "
         "Pickup: pay at the store. Delivery: the driver brings the card machine "
         "&mdash; pay by card at the door. No payment is taken here. "
@@ -1202,7 +1309,10 @@ def order_page():
 def api_order():
     """Create a pickup or delivery order. All prices are recomputed
     server-side from verns_menu.json — any total the browser sends is ignored.
-    Delivery always costs the flat Calgary fee (_DELIVERY_FEE + _CARD_FEE)."""
+    Delivery always costs the flat Calgary fee (_DELIVERY_FEE + _CARD_FEE).
+    Orders are taken any time — ASAP and scheduled times are worked out
+    against the next time the kitchen can make them, and the order is stored
+    under its ready day so the kitchen sees it on the morning it is made."""
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
     phone = (data.get("phone") or "").strip()
@@ -1222,22 +1332,21 @@ def api_order():
     if not isinstance(items, list) or not items:
         return jsonify({"error": "Please add at least one item."}), 400
     now = _calgary_now()
-    open_dt, close_dt = _store_hours_today(now)
-    if not (open_dt <= now <= close_dt):
-        return jsonify({"error": "We're closed right now — please order during open hours."}), 400
     if pickup_type == "asap":
-        ready = now + timedelta(minutes=_PICKUP_LEAD_MINUTES)
-        if ready > close_dt:
-            return jsonify({"error": "ASAP is no longer available today — please pick a time."}), 400
-        # Store the estimated ready clock time; the confirmation page explains it.
-        pickup_time = ready.strftime("%H:%M")
+        # Ready when the kitchen next can make it; never rejected for being
+        # too early or too late. Stored under its ready day.
+        ready_dt = _asap_ready(now)
+        pickup_time = ready_dt.strftime("%H:%M")
+        order_date = ready_dt.strftime("%Y-%m-%d")
     elif pickup_type == "scheduled":
-        if pickup_time not in _pickup_slots(now):
-            return jsonify({"error": "Please pick a valid pickup time today."}), 400
+        slot_values = [v for v, _ in _pickup_slots(now)]
+        if pickup_time not in slot_values:
+            return jsonify({"error": "Please pick a valid pickup time."}), 400
+        order_date, pickup_time = pickup_time.split(" ")
     else:
         return jsonify({"error": "Please choose ASAP or a pickup time."}), 400
     order, err = create_order(name, phone, pickup_type, pickup_time, items,
-                              order_type, delivery_address)
+                              order_type, delivery_address, order_date)
     if err:
         return jsonify({"error": err}), 400
     log_visit("/order")
@@ -1318,11 +1427,18 @@ def order_confirmation(order_number):
     phone_digits = store_phone.replace("-", "").replace(" ", "")
     is_delivery = (order.get("order_type") or "pickup") == "delivery"
     fulfil_label = "Delivery" if is_delivery else "Pickup"
+    today = _calgary_now().strftime("%Y-%m-%d")
+    ready_date = order.get("order_date") or today
+    day = _day_word(ready_date, today)
     if order["pickup_type"] == "asap":
-        when = (f"ASAP &mdash; ready in about 45 minutes to an hour "
-               f"(around {_clock_label(order['pickup_time'])})")
+        if ready_date == today:
+            when = (f"ASAP &mdash; ready in about 45 minutes to an hour "
+                   f"(around {_clock_label(order['pickup_time'])})")
+        else:
+            day_phrase = day.lower() if day in ("Today", "Tomorrow") else day
+            when = f"ASAP &mdash; ready {day_phrase} at {_clock_label(order['pickup_time'])}"
     else:
-        when = f"Today at {_clock_label(order['pickup_time'])}"
+        when = f"{day} at {_clock_label(order['pickup_time'])}"
     rows = "".join(
         f"<li><span>{ln['quantity']} &times; {html.escape(ln['name'])}"
         + (f" &mdash; {html.escape(ln['detail'])}" if ln["detail"] else "")
@@ -1431,7 +1547,8 @@ def kitchen():
             if o["pickup_type"] == "asap":
                 when = f"ASAP (ready ~{_clock_label(o['pickup_time'])})"
             else:
-                when = f"Today at {_clock_label(o['pickup_time'])}"
+                day = _day_word(o.get("order_date") or "", _calgary_now().strftime("%Y-%m-%d"))
+                when = f"{day} at {_clock_label(o['pickup_time'])}"
             fulfil_line = f"Delivery: {when}" if is_delivery else f"Pickup: {when}"
             items = "".join(
                 f"<li>{ln['quantity']} &times; {html.escape(ln['name'])}"
