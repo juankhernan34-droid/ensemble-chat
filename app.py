@@ -105,9 +105,9 @@ def init_db():
         )
     """)
 
-    # Vern's Pizza pickup orders (pay at the store — no payment data anywhere)
-    # order_type / delivery_address / delivery_fee are for a later delivery
-    # build; v1 is pickup only (order_type is always 'pickup', fee is 0).
+    # Vern's Pizza orders (pay at the store for pickup, by card at the door
+    # for delivery — no payment data anywhere). order_type is 'pickup' or
+    # 'delivery'; delivery orders carry delivery_address and delivery_fee.
     c.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY,
@@ -610,6 +610,14 @@ _STORE_HOURS = {
 # The kitchen needs at least 45 minutes; the app quotes "45 minutes to an hour"
 _PICKUP_LEAD_MINUTES = 45
 
+# Delivery: Calgary delivery fee plus the card-machine fee. The driver takes
+# the card machine to the door, so delivery is always paid by card on
+# arrival — no payment is taken in the app. Airdrie / Okotoks are sometimes
+# served and the store confirms the fee by phone; the app never invents a
+# higher out-of-town fee, it only ever charges the Calgary fee below.
+_DELIVERY_FEE = 3.50
+_CARD_FEE = 1.00
+
 # Shared kitchen access code, set as an env var in Render (KITCHEN_CODE).
 # No default code — if it is not set, the kitchen page says so instead of
 # letting anyone in.
@@ -715,10 +723,13 @@ def _lookup_price(menu, category, name, variant):
     return None, None
 
 
-def create_order(customer_name, customer_phone, pickup_type, pickup_time, items):
+def create_order(customer_name, customer_phone, pickup_type, pickup_time, items,
+                 order_type="pickup", delivery_address=""):
     """Price the items from verns_menu.json and insert the order + its lines.
     Returns (order_dict, None) on success, (None, error_message) on failure.
-    The client-sent total (if any) is never used."""
+    The client-sent total (if any) is never used. Delivery orders are charged
+    the flat Calgary fee (_DELIVERY_FEE + _CARD_FEE) — recomputed here, never
+    taken from the browser."""
     menu = load_menu()
     if not menu:
         return None, "The menu is unavailable right now."
@@ -750,6 +761,12 @@ def create_order(customer_name, customer_phone, pickup_type, pickup_time, items)
     if not lines:
         return None, "Your order is empty."
     subtotal = round(subtotal, 2)
+    if order_type == "delivery":
+        delivery_fee = round(_DELIVERY_FEE + _CARD_FEE, 2)
+    else:
+        order_type = "pickup"
+        delivery_fee = 0.0
+        delivery_address = ""
     order_date = _calgary_now().strftime("%Y-%m-%d")
     conn = sqlite3.connect("ensemble_chat.db")
     try:
@@ -764,9 +781,11 @@ def create_order(customer_name, customer_phone, pickup_type, pickup_time, items)
                 c.execute(
                     "INSERT INTO orders (order_number, order_date, customer_name,"
                     " customer_phone, pickup_type, pickup_time, items_json, subtotal,"
-                    " status, order_type) VALUES (?,?,?,?,?,?,?,?, 'new', 'pickup')",
+                    " status, order_type, delivery_address, delivery_fee)"
+                    " VALUES (?,?,?,?,?,?,?,?, 'new', ?, ?, ?)",
                     (number, order_date, customer_name, customer_phone,
-                     pickup_type, pickup_time, json.dumps(lines), subtotal),
+                     pickup_type, pickup_time, json.dumps(lines), subtotal,
+                     order_type, delivery_address, delivery_fee),
                 )
                 order_id = c.lastrowid
                 for ln in lines:
@@ -785,6 +804,9 @@ def create_order(customer_name, customer_phone, pickup_type, pickup_time, items)
                 "customer_name": customer_name, "customer_phone": customer_phone,
                 "pickup_type": pickup_type, "pickup_time": pickup_time,
                 "items": lines, "subtotal": subtotal, "status": "new",
+                "order_type": order_type, "delivery_address": delivery_address,
+                "delivery_fee": delivery_fee,
+                "total": round(subtotal + delivery_fee, 2),
             }, None
         return None, "Could not place your order — please try again."
     finally:
@@ -964,7 +986,7 @@ def _order_item_row(category, name, price, note=None, toppings=None, is_pizza=Fa
 
 @app.route("/order", methods=["GET"])
 def order_page():
-    """Pickup order form (phone-first, no account). Closed-hours message outside open hours."""
+    """Pickup or delivery order form (phone-first, no account). Closed-hours message outside open hours."""
     log_visit("/order")
     m = load_menu()
     if not m:
@@ -979,13 +1001,13 @@ def order_page():
         closed_note = f"We&rsquo;re closed right now &mdash; we open at {_clock_label(open_dt.strftime('%H:%M'))} today."
     else:
         # Open, but the kitchen needs 45 minutes and nothing can be ready before closing.
-        closed_note = (f"We&rsquo;re not taking pickup orders any more today &mdash; we close at "
+        closed_note = (f"We&rsquo;re not taking orders any more today &mdash; we close at "
                        f"{_clock_label(close_dt.strftime('%H:%M'))} and the kitchen needs 45 minutes. "
                        f"We open again at {_clock_label(open_dt.strftime('%H:%M'))} tomorrow.")
     if not (open_dt <= now <= close_dt) or (not slots and not asap_ok):
         return (
-            _order_page_head("Order for Pickup — Vern's Pizza")
-            + "<h1>Order for Pickup</h1>"
+            _order_page_head("Order — Vern's Pizza")
+            + "<h1>Order</h1>"
             f"<p>{closed_note}</p>"
             f"<p>Store hours: Mon&ndash;Tue {html.escape(store['hours']['mon_tue'])}, "
             f"Wed&ndash;Sat {html.escape(store['hours']['wed_sat'])}, "
@@ -1040,11 +1062,12 @@ def order_page():
         "<p class=\"note\">No more pickup times today.</p>"
     )
     body = (
-        "<h1>Order for Pickup</h1>"
+        "<h1>Order — Pickup or Delivery</h1>"
         f"<p class=\"store\">{html.escape(store['name'])} &middot; {html.escape(store['address'])}<br>"
         f"Phone: <a href=\"tel:{phone_digits}\">{html.escape(store['phone'])}</a></p>"
         "<p class=\"note\">Pick your items, then tell us your name and phone. "
-        "You pay at the store when you pick up &mdash; no payment is taken here. "
+        "Pickup: pay at the store. Delivery: the driver brings the card machine "
+        "&mdash; pay by card at the door. No payment is taken here. "
         "Prices are the menu prices; GST is added at the store till.</p>"
         + "".join(sections) +
         "<h2>Drinks</h2>"
@@ -1052,15 +1075,29 @@ def order_page():
         "&mdash; just ask when you pick up. They are not priced in the app.</p>"
         "<h2>Your details</h2>"
         "<form id=\"order-form\">"
+        "<label>How do you want your order?</label>"
+        "<label class=\"radio-row\"><input type=\"radio\" name=\"fulfilment\" value=\"pickup\" checked> "
+        "Pickup &mdash; pay at the store</label>"
+        "<label class=\"radio-row\"><input type=\"radio\" name=\"fulfilment\" value=\"delivery\"> "
+        "Delivery &mdash; driver brings the card machine</label>"
+        "<div id=\"delivery-info\" class=\"note\" style=\"display:none;\">"
+        f"Delivery in Calgary: {_money(_DELIVERY_FEE)} delivery fee + {_money(_CARD_FEE)} card-machine fee. "
+        "About 45 minutes to an hour. Airdrie and Okotoks sometimes &mdash; "
+        "the store will call to confirm the fee.</div>"
         "<label>Your name<input type=\"text\" id=\"cust_name\" autocomplete=\"name\" required></label>"
         "<label>Phone number<input type=\"tel\" id=\"cust_phone\" autocomplete=\"tel\" required "
         "placeholder=\"e.g. 403-555-0123\"></label>"
-        "<label>Pickup time</label>"
+        "<div id=\"delivery-address-block\" style=\"display:none;\">"
+        "<label>Delivery address<input type=\"text\" id=\"delivery_address\" "
+        "autocomplete=\"street-address\" placeholder=\"e.g. 123 45 Ave SE, Calgary\"></label></div>"
+        "<label><span id=\"time-label\">Pickup time</span></label>"
         + asap_radio + sched_radio +
         "<div class=\"error\" id=\"order-error\"></div>"
-        "<div class=\"subtotal-bar\"><span>Subtotal</span><span id=\"subtotal\">$0.00</span></div>"
+        "<div id=\"fee-lines\" class=\"note\" style=\"display:none;\">"
+        f"Delivery fee {_money(_DELIVERY_FEE)} + card-machine fee {_money(_CARD_FEE)}</div>"
+        "<div class=\"subtotal-bar\"><span id=\"subtotal-label\">Subtotal</span><span id=\"subtotal\">$0.00</span></div>"
         "<button type=\"submit\" class=\"big-btn\" id=\"place-order\">Place Pickup Order</button>"
-        "<p class=\"note\">Pay at the store when you pick up. GST is added at the store.</p>"
+        "<p class=\"note\">Pickup: pay at the store. Delivery: pay by card at the door. GST is added at the store.</p>"
         "</form>"
         "<script>\n"
         "function money(n){ return '$' + n.toFixed(2); }\n"
@@ -1068,6 +1105,11 @@ def order_page():
         "  var sel = row.querySelector('select.variant');\n"
         "  if (sel) { return parseFloat(sel.options[sel.selectedIndex].getAttribute('data-price') || '0'); }\n"
         "  return parseFloat(row.getAttribute('data-price') || '0');\n"
+        "}\n"
+        "var DELIVERY_FEE = " + f"{_DELIVERY_FEE + _CARD_FEE:.2f}" + ";\n"
+        "function fulfilment(){\n"
+        "  var r = document.querySelector('input[name=fulfilment]:checked');\n"
+        "  return r ? r.value : 'pickup';\n"
         "}\n"
         "function updateSubtotal(){\n"
         "  var total = 0;\n"
@@ -1077,7 +1119,14 @@ def order_page():
         "    row.querySelector('.line-total').textContent = money(line);\n"
         "    total += line;\n"
         "  });\n"
-        "  document.getElementById('subtotal').textContent = money(total);\n"
+        "  var isDelivery = fulfilment() === 'delivery';\n"
+        "  document.getElementById('subtotal').textContent = money(total + (isDelivery ? DELIVERY_FEE : 0));\n"
+        "  document.getElementById('subtotal-label').textContent = isDelivery ? 'Total' : 'Subtotal';\n"
+        "  document.getElementById('fee-lines').style.display = isDelivery ? 'block' : 'none';\n"
+        "  document.getElementById('delivery-info').style.display = isDelivery ? 'block' : 'none';\n"
+        "  document.getElementById('delivery-address-block').style.display = isDelivery ? 'block' : 'none';\n"
+        "  document.getElementById('time-label').textContent = isDelivery ? 'Delivery time' : 'Pickup time';\n"
+        "  document.getElementById('place-order').textContent = isDelivery ? 'Place Delivery Order' : 'Place Pickup Order';\n"
         "}\n"
         "document.addEventListener('click', function(e){\n"
         "  var btn = e.target.closest('.plus, .minus');\n"
@@ -1092,6 +1141,7 @@ def order_page():
         "});\n"
         "document.addEventListener('change', function(e){\n"
         "  if (e.target.classList.contains('variant')) updateSubtotal();\n"
+        "  if (e.target.name === 'fulfilment') updateSubtotal();\n"
         "});\n"
         "document.getElementById('order-form').addEventListener('submit', function(e){\n"
         "  e.preventDefault();\n"
@@ -1107,6 +1157,13 @@ def order_page():
         "      variant: sel ? sel.value : '', quantity: qty});\n"
         "  });\n"
         "  var pickupType = document.querySelector('input[name=pickup_type]:checked');\n"
+        "  var fulfil = fulfilment();\n"
+        "  var address = document.getElementById('delivery_address').value.trim();\n"
+        "  if (fulfil === 'delivery' && address.length < 5) {\n"
+        "    err.textContent = 'Please enter your delivery address.';\n"
+        "    err.style.display = 'block';\n"
+        "    return;\n"
+        "  }\n"
         "  var pickupTime = '';\n"
         "  if (pickupType && pickupType.value === 'scheduled') {\n"
         "    var timeSel = document.getElementById('pickup_time');\n"
@@ -1119,38 +1176,45 @@ def order_page():
         "    body: JSON.stringify({name: document.getElementById('cust_name').value,\n"
         "      phone: document.getElementById('cust_phone').value,\n"
         "      pickup_type: pickupType ? pickupType.value : 'asap',\n"
-        "      pickup_time: pickupTime, items: items})})\n"
+        "      pickup_time: pickupTime, order_type: fulfil, delivery_address: address, items: items})})\n"
         "  .then(function(r){ return r.json().then(function(j){ return {status: r.status, body: j}; }); })\n"
         "  .then(function(res){\n"
         "    if (res.status === 201) { window.location = '/order/' + res.body.order_number; return; }\n"
         "    err.textContent = res.body.error || 'Something went wrong. Please try again or call the store.';\n"
         "    err.style.display = 'block';\n"
         "    btn.disabled = false;\n"
-        "    btn.textContent = 'Place Pickup Order';\n"
+        "    btn.textContent = fulfil === 'delivery' ? 'Place Delivery Order' : 'Place Pickup Order';\n"
         "  })\n"
         "  .catch(function(){\n"
         "    err.textContent = 'Could not reach the store. Please try again or call the store.';\n"
         "    err.style.display = 'block';\n"
         "    btn.disabled = false;\n"
-        "    btn.textContent = 'Place Pickup Order';\n"
+        "    btn.textContent = fulfil === 'delivery' ? 'Place Delivery Order' : 'Place Pickup Order';\n"
         "  });\n"
         "});\n"
         "updateSubtotal();\n"
         "</script>\n"
     )
-    return _order_page_head("Order for Pickup — Vern's Pizza") + body + _order_page_foot()
+    return _order_page_head("Order — Vern's Pizza") + body + _order_page_foot()
 
 
 @app.route("/api/order", methods=["POST"])
 def api_order():
-    """Create a pickup order. All prices are recomputed server-side from
-    verns_menu.json — any total the browser sends is ignored."""
+    """Create a pickup or delivery order. All prices are recomputed
+    server-side from verns_menu.json — any total the browser sends is ignored.
+    Delivery always costs the flat Calgary fee (_DELIVERY_FEE + _CARD_FEE)."""
     data = request.get_json(silent=True) or {}
     name = (data.get("name") or "").strip()
     phone = (data.get("phone") or "").strip()
     pickup_type = data.get("pickup_type") or "asap"
     pickup_time = (data.get("pickup_time") or "").strip()
+    order_type = (data.get("order_type") or "pickup").strip().lower()
+    delivery_address = (data.get("delivery_address") or "").strip()
     items = data.get("items") or []
+    if order_type not in ("pickup", "delivery"):
+        return jsonify({"error": "Please choose pickup or delivery."}), 400
+    if order_type == "delivery" and len(delivery_address) < 5:
+        return jsonify({"error": "Please enter your delivery address."}), 400
     if not name:
         return jsonify({"error": "Please enter your name."}), 400
     if len(re.sub(r"\D", "", phone)) < 7:
@@ -1172,7 +1236,8 @@ def api_order():
             return jsonify({"error": "Please pick a valid pickup time today."}), 400
     else:
         return jsonify({"error": "Please choose ASAP or a pickup time."}), 400
-    order, err = create_order(name, phone, pickup_type, pickup_time, items)
+    order, err = create_order(name, phone, pickup_type, pickup_time, items,
+                              order_type, delivery_address)
     if err:
         return jsonify({"error": err}), 400
     log_visit("/order")
@@ -1181,6 +1246,10 @@ def api_order():
         "pickup_type": pickup_type,
         "pickup_time": pickup_time,
         "subtotal": order["subtotal"],
+        "order_type": order["order_type"],
+        "delivery_address": order["delivery_address"],
+        "delivery_fee": order["delivery_fee"],
+        "total": order["total"],
     }), 201
 
 
@@ -1229,8 +1298,8 @@ document.getElementById('wait-ask').addEventListener('click', function(){
 
 @app.route("/order/<order_number>", methods=["GET"])
 def order_confirmation(order_number):
-    """Confirmation page for one order: number, pickup time, items, subtotal,
-    and the pay-at-the-store note."""
+    """Confirmation page for one order: number, pickup/delivery time, items,
+    subtotal, delivery fee when applicable, and the pay note."""
     order = get_order(order_number)
     if not order:
         return (
@@ -1247,6 +1316,8 @@ def order_confirmation(order_number):
     store_addr = store.get("address", "#127, 575 28th Street S.E., Calgary")
     store_phone = store.get("phone", "403-508-0220")
     phone_digits = store_phone.replace("-", "").replace(" ", "")
+    is_delivery = (order.get("order_type") or "pickup") == "delivery"
+    fulfil_label = "Delivery" if is_delivery else "Pickup"
     if order["pickup_type"] == "asap":
         when = (f"ASAP &mdash; ready in about 45 minutes to an hour "
                f"(around {_clock_label(order['pickup_time'])})")
@@ -1258,15 +1329,37 @@ def order_confirmation(order_number):
         + f"</span><span class=\"price\">{_money(ln['line_total'])}</span></li>"
         for ln in order["items"]
     )
+    if is_delivery:
+        fee = order.get("delivery_fee") or 0.0
+        totals_html = (
+            f"<p><strong>Subtotal: {_money(order['subtotal'])}</strong><br>"
+            f"<strong>Delivery fee: {_money(fee)}</strong> "
+            f"({_money(_DELIVERY_FEE)} delivery + {_money(_CARD_FEE)} card-machine fee)<br>"
+            f"<strong>Total: {_money(round(order['subtotal'] + fee, 2))}</strong><br>"
+            "<span class=\"note\">GST is added at the store till.</span></p>"
+        )
+        pay_html = ("<p class=\"pay-note\">Pay by card when the driver arrives "
+                    "&mdash; the driver brings the card machine. No payment was taken here.</p>")
+        address_html = (f"<p><strong>Deliver to:</strong> "
+                        f"{html.escape(order.get('delivery_address') or '')}</p>")
+    else:
+        totals_html = (
+            f"<p><strong>Subtotal: {_money(order['subtotal'])}</strong><br>"
+            "<span class=\"note\">GST is added at the store till.</span></p>"
+        )
+        pay_html = ("<p class=\"pay-note\">Pay at the store when you pick up "
+                    "&mdash; no payment was taken here.</p>")
+        address_html = ""
     body = (
         "<h1>Order placed!</h1>"
         f"<p>Your order number is:</p><p class=\"big-number\">{html.escape(order['order_number'])}</p>"
-        f"<p><strong>Pickup:</strong> {when}</p>"
+        f"<p><strong>{fulfil_label}:</strong> {when}</p>"
+        f"<p>We&rsquo;ll call you at {html.escape(order['customer_phone'])} when your order is ready.</p>"
         f"<p><strong>Name:</strong> {html.escape(order['customer_name'])}</p>"
+        + address_html +
         "<ul class=\"menu-list\">" + rows + "</ul>"
-        f"<p><strong>Subtotal: {_money(order['subtotal'])}</strong><br>"
-        "<span class=\"note\">GST is added at the store till.</span></p>"
-        "<p class=\"pay-note\">Pay at the store when you pick up &mdash; no payment was taken here.</p>"
+        + totals_html
+        + pay_html +
         f"<p>{html.escape(store_name)} &middot; "
         f"{html.escape(store_addr)}<br>"
         f"Phone: <a href=\"tel:{phone_digits}\">{html.escape(store_phone)}</a> "
@@ -1330,11 +1423,16 @@ def kitchen():
         cards = ""
         for o in orders:
             status = o["status"]
-            badge = {"new": "NEW", "ready": "READY", "picked_up": "PICKED UP"}.get(status, status.upper())
+            is_delivery = (o.get("order_type") or "pickup") == "delivery"
+            if status == "picked_up" and is_delivery:
+                badge = "DELIVERED"
+            else:
+                badge = {"new": "NEW", "ready": "READY", "picked_up": "PICKED UP"}.get(status, status.upper())
             if o["pickup_type"] == "asap":
                 when = f"ASAP (ready ~{_clock_label(o['pickup_time'])})"
             else:
                 when = f"Today at {_clock_label(o['pickup_time'])}"
+            fulfil_line = f"Delivery: {when}" if is_delivery else f"Pickup: {when}"
             items = "".join(
                 f"<li>{ln['quantity']} &times; {html.escape(ln['name'])}"
                 + (f" &mdash; {html.escape(ln['detail'])}" if ln["detail"] else "")
@@ -1350,20 +1448,38 @@ def kitchen():
             if status in ("new", "ready"):
                 buttons += (
                     f"<button class=\"kbtn kbtn-picked\" data-order=\"{html.escape(o['order_number'])}\" "
-                    "data-status=\"picked_up\">Picked Up</button>"
+                    f"data-status=\"picked_up\">{'Delivered' if is_delivery else 'Picked Up'}</button>"
                 )
             phone_digits = re.sub(r"\D", "", o["customer_phone"])
+            delivery_html = ""
+            if is_delivery:
+                fee = o.get("delivery_fee") or 0.0
+                delivery_html = (
+                    f"<div><span class=\"badge badge-delivery\">DELIVERY</span> "
+                    f"<strong>{html.escape(o.get('delivery_address') or '')}</strong></div>"
+                )
+                totals_html = (
+                    f"<div><strong>Subtotal: {_money(o['subtotal'])}</strong> &middot; "
+                    f"Delivery fee: {_money(fee)} &middot; "
+                    f"<strong>Total: {_money(round(o['subtotal'] + fee, 2))}</strong> "
+                    "<span class=\"note\">(GST added at the till; pay by card at the door)</span></div>"
+                )
+            else:
+                totals_html = (
+                    f"<div><strong>Subtotal: {_money(o['subtotal'])}</strong> "
+                    "<span class=\"note\">(GST added at the till)</span></div>"
+                )
             cards += (
-                "<div class=\"order-card\">"
+                f"<div class=\"order-card{' delivery' if is_delivery else ''}\">"
                 f"<div><span class=\"num\">{html.escape(o['order_number'])}</span> "
                 f"<span class=\"badge badge-{status}\">{badge}</span></div>"
                 f"<div><strong>{html.escape(o['customer_name'])}</strong> &middot; "
                 f"<a href=\"tel:{html.escape(phone_digits)}\">"
                 f"{html.escape(o['customer_phone'])}</a></div>"
-                f"<div>Pickup: {when}</div>"
+                + delivery_html +
+                f"<div>{fulfil_line}</div>"
                 f"<ul>{items}</ul>"
-                f"<div><strong>Subtotal: {_money(o['subtotal'])}</strong> "
-                "<span class=\"note\">(GST added at the till)</span></div>"
+                + totals_html +
                 f"<div>{buttons}</div></div>"
             )
     body = (
@@ -1403,7 +1519,9 @@ def kitchen():
         "  .kbtn { padding: 0.6rem 1.2rem; font-size: 1.05rem; font-weight: 700; border-radius: 8px; border: 1px solid #333; background: #fff; cursor: pointer; margin: 0.3rem 0.3rem 0 0; }\n"
         "  .kbtn-ready { background: #198754; color: #fff; border-color: #198754; }\n"
         "  .kbtn-picked { background: #333; color: #fff; }\n"
-        "</style>\n</head>\n<body>\n" + body + "\n</body>\n</html>\n"
+                "  .badge-delivery { background: #cfe2ff; color: #084298; }\n"
+        "  .order-card.delivery { border-color: #1a73e8; }\n"
+"</style>\n</head>\n<body>\n" + body + "\n</body>\n</html>\n"
     )
 
 
