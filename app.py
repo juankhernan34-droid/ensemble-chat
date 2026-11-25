@@ -21,6 +21,8 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from functools import wraps
 import sqlite3
+import time
+from threading import Lock
 
 from flask import Flask, request, jsonify, render_template, redirect, url_for, session
 from flask_cors import CORS
@@ -248,7 +250,7 @@ def increment_usage(user_id, requests=1):
     conn.commit()
     conn.close()
 
-def call_gen(client, model_id, prompt, max_new_tokens=180):
+def call_gen(client, model_id, prompt, max_new_tokens=800):
     """Call a single model through the configured inference provider via direct HTTP.
 
     Provider selection (env):
@@ -287,7 +289,7 @@ def call_gen(client, model_id, prompt, max_new_tokens=180):
         text = str(out)
     return text.strip()
 
-def safe_call_gen(client, model_id, prompt, max_new_tokens=180):
+def safe_call_gen(client, model_id, prompt, max_new_tokens=800):
     """Call one model, returning error string instead of raising.
 
     Retries once when the model returns an empty reply (free-tier
@@ -1182,6 +1184,49 @@ def api_order():
     }), 201
 
 
+_WAIT_CHAT_CSS = (
+    "  .wait-chat textarea { width: 100%; min-height: 80px; padding: 0.5rem; font-size: 1rem; box-sizing: border-box; margin-top: 0.25rem; }\n"
+    "  .wait-answer { margin-top: 1rem; padding: 1rem; border: 1px solid #ccc; border-radius: 8px; background: #fafafa; white-space: pre-wrap; }\n"
+)
+
+_WAIT_CHAT_HTML = """
+<h2>Chat while you wait</h2>
+<p class="note">Your pizza is being made &mdash; chat with Atlas, our AI, while you wait. No signup, just ask.</p>
+<div class="wait-chat">
+  <label for="wait-prompt">Ask Atlas anything</label>
+  <textarea id="wait-prompt" rows="3" placeholder="e.g. What toppings go well with pepperoni?"></textarea>
+  <button type="button" class="big-btn" id="wait-ask">Ask Atlas</button>
+  <div id="wait-answer" class="wait-answer" style="display:none;"></div>
+  <p class="note">Free while you wait &mdash; a few questions per visit. <a href="/demo">Try the full Atlas Chat demo</a>.</p>
+</div>
+<script>
+document.getElementById('wait-ask').addEventListener('click', function(){
+  var box = document.getElementById('wait-prompt');
+  var ans = document.getElementById('wait-answer');
+  var btn = document.getElementById('wait-ask');
+  var q = box.value.trim();
+  if (!q) { ans.style.display = 'block'; ans.textContent = 'Type a question first.'; return; }
+  btn.disabled = true;
+  btn.textContent = 'Atlas is thinking...';
+  ans.style.display = 'block';
+  ans.textContent = 'Thinking...';
+  fetch('/api/wait-chat', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({prompt: q})})
+  .then(function(r){ return r.json().then(function(j){ return {status: r.status, body: j}; }); })
+  .then(function(res){
+    ans.textContent = res.body.answer || res.body.error || 'Something went wrong. Please try again.';
+    btn.disabled = false;
+    btn.textContent = 'Ask Atlas';
+  })
+  .catch(function(){
+    ans.textContent = 'Could not reach the chat. Please try again.';
+    btn.disabled = false;
+    btn.textContent = 'Ask Atlas';
+  });
+});
+</script>
+"""
+
 @app.route("/order/<order_number>", methods=["GET"])
 def order_confirmation(order_number):
     """Confirmation page for one order: number, pickup time, items, subtotal,
@@ -1226,9 +1271,10 @@ def order_confirmation(order_number):
         f"{html.escape(store_addr)}<br>"
         f"Phone: <a href=\"tel:{phone_digits}\">{html.escape(store_phone)}</a> "
         "&mdash; call if anything goes wrong with your order.</p>"
-        "<p><a href=\"/menu\">Back to the menu</a></p>"
+        + _WAIT_CHAT_HTML
+        + "<p><a href=\"/menu\">Back to the menu</a></p>"
     )
-    return _order_page_head(f"Order {html.escape(order['order_number'])} — Vern's Pizza") + body + _order_page_foot()
+    return _order_page_head(f"Order {html.escape(order['order_number'])} — Vern's Pizza", extra_css=_WAIT_CHAT_CSS) + body + _order_page_foot()
 
 
 def _kitchen_login_page(error=None):
@@ -1656,6 +1702,48 @@ def chat():
             "remaining": limit - usage
         }
     })
+
+# Waiting-room chat: no API key, small per-visitor cap so one person cannot
+# drain the shared Groq free tier. No DB writes, no new files.
+# (Render sits behind a proxy, so the real visitor IP comes from
+# X-Forwarded-For; remote_addr alone would be the proxy for everyone.)
+_WAIT_CHAT_LIMIT = 5          # questions per visitor per hour
+_WAIT_CHAT_WINDOW = 3600      # seconds
+_WAIT_CHAT_MAX_PROMPT = 500   # characters
+_wait_chat_hits = {}
+_wait_chat_lock = Lock()
+
+
+def _wait_chat_allowed(ip):
+    now = time.time()
+    with _wait_chat_lock:
+        hits = [t for t in _wait_chat_hits.get(ip, []) if now - t < _WAIT_CHAT_WINDOW]
+        if len(hits) >= _WAIT_CHAT_LIMIT:
+            return False
+        hits.append(now)
+        _wait_chat_hits[ip] = hits
+        return True
+
+
+@app.route("/api/wait-chat", methods=["POST"])
+def wait_chat():
+    """Guest chat for waiting Vern's customers: the same ensemble as /demo,
+    no signup. Capped per visitor so the shared free-tier models are safe."""
+    data = request.get_json(silent=True) or {}
+    prompt = (data.get("prompt") or "").strip()
+    if not prompt:
+        return jsonify({"error": "Type a question first."}), 400
+    if len(prompt) > _WAIT_CHAT_MAX_PROMPT:
+        return jsonify({"error": "Please keep your question shorter."}), 400
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    ip = forwarded.split(",")[0].strip() if forwarded else (request.remote_addr or "unknown")
+    if not _wait_chat_allowed(ip):
+        return jsonify({"error": "That is enough questions for now — please try again in a bit."}), 429
+    response = ask_ensemble(prompt)
+    if "error" in response:
+        return jsonify({"error": "The chat is having trouble right now. Please try again in a minute."}), 502
+    return jsonify({"answer": response["answer"]})
+
 
 @app.route("/api/usage", methods=["GET"])
 @require_api_key
