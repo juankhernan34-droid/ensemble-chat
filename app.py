@@ -23,6 +23,9 @@ from functools import wraps
 import sqlite3
 import time
 from threading import Lock
+import math
+import urllib.request
+import urllib.parse
 
 from flask import Flask, request, jsonify, render_template, redirect, url_for, session
 from flask_cors import CORS
@@ -132,6 +135,7 @@ def init_db():
                 order_type TEXT DEFAULT 'pickup',
                 delivery_address TEXT,
                 delivery_fee REAL DEFAULT 0,
+                delivery_distance_km REAL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(order_number, order_date)
             )
@@ -160,10 +164,17 @@ def init_db():
             order_type TEXT DEFAULT 'pickup',
             delivery_address TEXT,
             delivery_fee REAL DEFAULT 0,
+            delivery_distance_km REAL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(order_number, order_date)
         )
     """)
+
+    # Delivery distance (km from the store) was added after launch; older
+    # databases lack the column, so add it when it is missing.
+    cols = [r[1] for r in c.execute("PRAGMA table_info(orders)").fetchall()]
+    if "delivery_distance_km" not in cols:
+        c.execute("ALTER TABLE orders ADD COLUMN delivery_distance_km REAL")
 
     # One row per ordered line, for the kitchen view
     c.execute("""
@@ -648,13 +659,124 @@ _STORE_HOURS = {
 # The kitchen needs at least 45 minutes; the app quotes "45 minutes to an hour"
 _PICKUP_LEAD_MINUTES = 45
 
-# Delivery: Calgary delivery fee plus the card-machine fee. The driver takes
-# the card machine to the door, so delivery is always paid by card on
-# arrival — no payment is taken in the app. Airdrie / Okotoks are sometimes
-# served and the store confirms the fee by phone; the app never invents a
-# higher out-of-town fee, it only ever charges the Calgary fee below.
+# Delivery: the fee depends on how far the customer is from the store —
+# $1.00 per kilometre on top of the $3.50 base, plus the $1.00 card-machine
+# fee. The driver takes the card machine to the door, so delivery is always
+# paid by card on arrival — no payment is taken in the app.
+#
+# STARTING FIGURES — Klen and Lili can change any number here.
+# Over 25 km (e.g. Airdrie / Okotoks) the delivery part caps at $10.00 and
+# the store calls to confirm the fee — the app never invents a higher
+# out-of-town fee.
 _DELIVERY_FEE = 3.50
 _CARD_FEE = 1.00
+_DELIVERY_PER_KM = 1.00
+_DELIVERY_FEE_CAP = 10.00
+_DELIVERY_CAP_KM = 25.0
+
+# Vern's Pizza, #127, 575 28th Street SE, Calgary — the point delivery
+# distance is measured from.
+_STORE_LAT = 51.0475
+_STORE_LON = -113.9905
+
+_GEOCODE_CACHE = {}
+_GEOCODE_LOCK = Lock()
+
+
+def _haversine_km(lat1, lon1, lat2, lon2):
+    """Straight-line distance in km between two lat/lon points."""
+    radius = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    return 2 * radius * math.asin(math.sqrt(a))
+
+
+def _delivery_fee_for_distance(distance_km):
+    """Delivery fee (before the card-machine fee) for a distance in km:
+    $3.50 base + $1.00 per km. Past 25 km (Airdrie / Okotoks) the fee caps
+    at $10.00 — the store confirms the real fee by phone instead."""
+    if distance_km > _DELIVERY_CAP_KM:
+        return _DELIVERY_FEE_CAP
+    return round(_DELIVERY_FEE + _DELIVERY_PER_KM * distance_km, 2)
+
+
+def _geocode_address(address):
+    """(lat, lon) for an address via OpenStreetMap Nominatim, or None.
+    Free, no key. A short timeout and a cache keep it from slowing orders;
+    anything that goes wrong returns None — the caller falls back to the
+    flat fee and never fails the order because of geocoding."""
+    key = (address or "").strip().lower()
+    if not key:
+        return None
+    with _GEOCODE_LOCK:
+        if key in _GEOCODE_CACHE:
+            return _GEOCODE_CACHE[key]
+    result = _geocode_query(address.strip())
+    if result is None:
+        # Nominatim often misses spelled-out street types ("28th Street SE");
+        # retry once with the usual abbreviations ("28th St SE").
+        short = _abbreviate_address(address.strip())
+        if short != address.strip():
+            result = _geocode_query(short)
+    with _GEOCODE_LOCK:
+        _GEOCODE_CACHE[key] = result
+    return result
+
+
+_ABBREVIATIONS = [
+    ("street", "St"), ("avenue", "Ave"), ("boulevard", "Blvd"),
+    ("drive", "Dr"), ("northwest", "NW"), ("northeast", "NE"),
+    ("southwest", "SW"), ("southeast", "SE"),
+]
+
+
+def _abbreviate_address(address):
+    """'575 28th Street SE' -> '575 28 St SE' (word-boundary matches).
+    Nominatim also misses ordinal suffixes ('28th'), so those go too."""
+    out = address
+    for long, short in _ABBREVIATIONS:
+        out = re.sub(r"\b" + long + r"\b", short, out, flags=re.IGNORECASE)
+    out = re.sub(r"\b(\d+)(st|nd|rd|th)\b", r"\1", out, flags=re.IGNORECASE)
+    return out
+
+
+def _geocode_query(query_text):
+    """One Nominatim lookup; (lat, lon) or None."""
+    try:
+        query = urllib.parse.urlencode({
+            "q": query_text + ", Alberta, Canada",
+            "format": "json",
+            "limit": 1,
+        })
+        req = urllib.request.Request(
+            "https://nominatim.openstreetmap.org/search?" + query,
+            headers={"User-Agent": "ensemble-chat-verms/1.0 (Vern's Pizza ordering)"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data:
+            return (float(data[0]["lat"]), float(data[0]["lon"]))
+    except Exception:
+        return None
+    return None
+
+
+def _delivery_fee_for_address(address):
+    """(delivery_fee, distance_km or None, note) for a delivery address.
+    delivery_fee already includes the $1.00 card-machine fee. When the
+    address cannot be geocoded, the flat $3.50 + $1.00 fee applies and the
+    note says the fee is confirmed by phone."""
+    latlon = _geocode_address(address)
+    if not latlon:
+        return round(_DELIVERY_FEE + _CARD_FEE, 2), None, "fee confirmed by phone"
+    distance = round(_haversine_km(_STORE_LAT, _STORE_LON, latlon[0], latlon[1]), 1)
+    fee = round(_delivery_fee_for_distance(distance) + _CARD_FEE, 2)
+    if distance > 25:
+        return fee, distance, "Airdrie / Okotoks — the store will call to confirm the fee"
+    return fee, distance, ""
 
 # Shared kitchen access code, set as an env var in Render (KITCHEN_CODE).
 # No default code — if it is not set, the kitchen page says so instead of
@@ -830,8 +952,8 @@ def create_order(customer_name, customer_phone, pickup_type, pickup_time, items,
     """Price the items from verns_menu.json and insert the order + its lines.
     Returns (order_dict, None) on success, (None, error_message) on failure.
     The client-sent total (if any) is never used. Delivery orders are charged
-    the flat Calgary fee (_DELIVERY_FEE + _CARD_FEE) — recomputed here, never
-    taken from the browser. order_date is the READY day (today unless the
+    by distance from the store (_delivery_fee_for_address) — recomputed here,
+    never taken from the browser. order_date is the READY day (today unless the
     caller worked out a later ready day); order numbers run per ready day."""
     menu = load_menu()
     if not menu:
@@ -865,11 +987,12 @@ def create_order(customer_name, customer_phone, pickup_type, pickup_time, items,
         return None, "Your order is empty."
     subtotal = round(subtotal, 2)
     if order_type == "delivery":
-        delivery_fee = round(_DELIVERY_FEE + _CARD_FEE, 2)
+        delivery_fee, delivery_distance, _fee_note = _delivery_fee_for_address(delivery_address)
     else:
         order_type = "pickup"
         delivery_fee = 0.0
         delivery_address = ""
+        delivery_distance = None
     order_date = order_date or _calgary_now().strftime("%Y-%m-%d")
     conn = sqlite3.connect("ensemble_chat.db")
     try:
@@ -884,11 +1007,12 @@ def create_order(customer_name, customer_phone, pickup_type, pickup_time, items,
                 c.execute(
                     "INSERT INTO orders (order_number, order_date, customer_name,"
                     " customer_phone, pickup_type, pickup_time, items_json, subtotal,"
-                    " status, order_type, delivery_address, delivery_fee)"
-                    " VALUES (?,?,?,?,?,?,?,?, 'new', ?, ?, ?)",
+                    " status, order_type, delivery_address, delivery_fee,"
+                    " delivery_distance_km)"
+                    " VALUES (?,?,?,?,?,?,?,?, 'new', ?, ?, ?, ?)",
                     (number, order_date, customer_name, customer_phone,
                      pickup_type, pickup_time, json.dumps(lines), subtotal,
-                     order_type, delivery_address, delivery_fee),
+                     order_type, delivery_address, delivery_fee, delivery_distance),
                 )
                 order_id = c.lastrowid
                 for ln in lines:
@@ -909,6 +1033,7 @@ def create_order(customer_name, customer_phone, pickup_type, pickup_time, items,
                 "items": lines, "subtotal": subtotal, "status": "new",
                 "order_type": order_type, "delivery_address": delivery_address,
                 "delivery_fee": delivery_fee,
+                "delivery_distance_km": delivery_distance,
                 "total": round(subtotal + delivery_fee, 2),
             }, None
         return None, "Could not place your order — please try again."
@@ -1188,7 +1313,9 @@ def order_page():
         "<label class=\"radio-row\"><input type=\"radio\" name=\"fulfilment\" value=\"delivery\"> "
         "Delivery &mdash; driver brings the card machine</label>"
         "<div id=\"delivery-info\" class=\"note\" style=\"display:none;\">"
-        f"Delivery in Calgary: {_money(_DELIVERY_FEE)} delivery fee + {_money(_CARD_FEE)} card-machine fee. "
+        f"Delivery fee depends on your area &mdash; {_money(_DELIVERY_FEE)} plus "
+        f"{_money(_DELIVERY_PER_KM)} per kilometre from the store, "
+        f"plus a {_money(_CARD_FEE)} card-machine fee. "
         "About 45 minutes to an hour. Airdrie and Okotoks sometimes &mdash; "
         "the store will call to confirm the fee.</div>"
         "<label>Your name<input type=\"text\" id=\"cust_name\" autocomplete=\"name\" required></label>"
@@ -1201,7 +1328,8 @@ def order_page():
         + asap_radio + sched_radio +
         "<div class=\"error\" id=\"order-error\"></div>"
         "<div id=\"fee-lines\" class=\"note\" style=\"display:none;\">"
-        f"Delivery fee {_money(_DELIVERY_FEE)} + card-machine fee {_money(_CARD_FEE)}</div>"
+        "Delivery fee <span id=\"fee-amount\">$4.50</span> (includes $1.00 card-machine fee)"
+        "<span id=\"fee-note\"></span></div>"
         "<div class=\"subtotal-bar\"><span id=\"subtotal-label\">Subtotal</span><span id=\"subtotal\">$0.00</span></div>"
         "<button type=\"submit\" class=\"big-btn\" id=\"place-order\">Place Pickup Order</button>"
         "<p class=\"note\">Pickup: pay at the store. Delivery: pay by card at the door. GST is added at the store.</p>"
@@ -1213,7 +1341,29 @@ def order_page():
         "  if (sel) { return parseFloat(sel.options[sel.selectedIndex].getAttribute('data-price') || '0'); }\n"
         "  return parseFloat(row.getAttribute('data-price') || '0');\n"
         "}\n"
-        "var DELIVERY_FEE = " + f"{_DELIVERY_FEE + _CARD_FEE:.2f}" + ";\n"
+        "var deliveryFee = " + f"{_DELIVERY_FEE + _CARD_FEE:.2f}" + ";\n"
+        "var feeTimer = null;\n"
+        "function fetchDeliveryFee(){\n"
+        "  var addr = document.getElementById('delivery_address').value.trim();\n"
+        "  if (fulfilment() !== 'delivery' || addr.length < 5) {\n"
+        "    deliveryFee = " + f"{_DELIVERY_FEE + _CARD_FEE:.2f}" + ";\n"
+        "    document.getElementById('fee-note').textContent = '';\n"
+        "    updateSubtotal();\n"
+        "    return;\n"
+        "  }\n"
+        "  fetch('/api/delivery-fee', {method: 'POST', headers: {'Content-Type': 'application/json'},\n"
+        "    body: JSON.stringify({address: addr})})\n"
+        "  .then(function(r){ return r.json(); })\n"
+        "  .then(function(j){\n"
+        "    if (typeof j.fee === 'number') { deliveryFee = j.fee; }\n"
+        "    var note = '';\n"
+        "    if (j.distance_km !== null && j.distance_km !== undefined) { note = ' (~' + j.distance_km + ' km from the store)'; }\n"
+        "    if (j.note) { note += (note ? ' - ' : ' ') + j.note; }\n"
+        "    document.getElementById('fee-note').textContent = note;\n"
+        "    updateSubtotal();\n"
+        "  })\n"
+        "  .catch(function(){ updateSubtotal(); });\n"
+        "}\n"
         "function fulfilment(){\n"
         "  var r = document.querySelector('input[name=fulfilment]:checked');\n"
         "  return r ? r.value : 'pickup';\n"
@@ -1227,7 +1377,8 @@ def order_page():
         "    total += line;\n"
         "  });\n"
         "  var isDelivery = fulfilment() === 'delivery';\n"
-        "  document.getElementById('subtotal').textContent = money(total + (isDelivery ? DELIVERY_FEE : 0));\n"
+        "  document.getElementById('subtotal').textContent = money(total + (isDelivery ? deliveryFee : 0));\n"
+        "  document.getElementById('fee-amount').textContent = money(deliveryFee);\n"
         "  document.getElementById('subtotal-label').textContent = isDelivery ? 'Total' : 'Subtotal';\n"
         "  document.getElementById('fee-lines').style.display = isDelivery ? 'block' : 'none';\n"
         "  document.getElementById('delivery-info').style.display = isDelivery ? 'block' : 'none';\n"
@@ -1248,7 +1399,11 @@ def order_page():
         "});\n"
         "document.addEventListener('change', function(e){\n"
         "  if (e.target.classList.contains('variant')) updateSubtotal();\n"
-        "  if (e.target.name === 'fulfilment') updateSubtotal();\n"
+        "  if (e.target.name === 'fulfilment') fetchDeliveryFee();\n"
+        "});\n"
+        "document.getElementById('delivery_address').addEventListener('input', function(){\n"
+        "  clearTimeout(feeTimer);\n"
+        "  feeTimer = setTimeout(fetchDeliveryFee, 600);\n"
         "});\n"
         "document.getElementById('order-form').addEventListener('submit', function(e){\n"
         "  e.preventDefault();\n"
@@ -1305,11 +1460,29 @@ def order_page():
     return _order_page_head("Order — Vern's Pizza") + body + _order_page_foot()
 
 
+@app.route("/api/delivery-fee", methods=["POST"])
+def api_delivery_fee():
+    """Estimated delivery fee for an address: {"fee", "distance_km", "note"}.
+    The fee shown here is an estimate — the order itself recomputes it
+    server-side, so any fee the browser sends is ignored."""
+    data = request.get_json(silent=True) or {}
+    address = (data.get("address") or "").strip()
+    if len(address) < 5:
+        return jsonify({
+            "fee": round(_DELIVERY_FEE + _CARD_FEE, 2),
+            "distance_km": None,
+            "note": "Enter your full address for an exact fee.",
+        })
+    fee, distance, note = _delivery_fee_for_address(address)
+    return jsonify({"fee": fee, "distance_km": distance, "note": note})
+
+
 @app.route("/api/order", methods=["POST"])
 def api_order():
     """Create a pickup or delivery order. All prices are recomputed
     server-side from verns_menu.json — any total the browser sends is ignored.
-    Delivery always costs the flat Calgary fee (_DELIVERY_FEE + _CARD_FEE).
+    The delivery fee depends on the distance from the store
+    (_delivery_fee_for_address) and is recomputed here too.
     Orders are taken any time — ASAP and scheduled times are worked out
     against the next time the kitchen can make them, and the order is stored
     under its ready day so the kitchen sees it on the morning it is made."""
@@ -1447,10 +1620,12 @@ def order_confirmation(order_number):
     )
     if is_delivery:
         fee = order.get("delivery_fee") or 0.0
+        distance = order.get("delivery_distance_km")
+        distance_html = (f" (~{distance:g} km from the store)" if distance is not None else "")
         totals_html = (
             f"<p><strong>Subtotal: {_money(order['subtotal'])}</strong><br>"
-            f"<strong>Delivery fee: {_money(fee)}</strong> "
-            f"({_money(_DELIVERY_FEE)} delivery + {_money(_CARD_FEE)} card-machine fee)<br>"
+            f"<strong>Delivery fee: {_money(fee)}</strong>{distance_html} "
+            f"({_money(round(fee - _CARD_FEE, 2))} delivery + {_money(_CARD_FEE)} card-machine fee)<br>"
             f"<strong>Total: {_money(round(order['subtotal'] + fee, 2))}</strong><br>"
             "<span class=\"note\">GST is added at the store till.</span></p>"
         )
@@ -1571,9 +1746,11 @@ def kitchen():
             delivery_html = ""
             if is_delivery:
                 fee = o.get("delivery_fee") or 0.0
+                distance = o.get("delivery_distance_km")
+                distance_html = (f" &middot; ~{distance:g} km from the store" if distance is not None else "")
                 delivery_html = (
                     f"<div><span class=\"badge badge-delivery\">DELIVERY</span> "
-                    f"<strong>{html.escape(o.get('delivery_address') or '')}</strong></div>"
+                    f"<strong>{html.escape(o.get('delivery_address') or '')}</strong>{distance_html}</div>"
                 )
                 totals_html = (
                     f"<div><strong>Subtotal: {_money(o['subtotal'])}</strong> &middot; "
