@@ -250,7 +250,7 @@ def increment_usage(user_id, requests=1):
     conn.commit()
     conn.close()
 
-def call_gen(client, model_id, prompt, max_new_tokens=800):
+def call_gen(client, model_id, prompt, max_new_tokens=2000):
     """Call a single model through the configured inference provider via direct HTTP.
 
     Provider selection (env):
@@ -289,7 +289,7 @@ def call_gen(client, model_id, prompt, max_new_tokens=800):
         text = str(out)
     return text.strip()
 
-def safe_call_gen(client, model_id, prompt, max_new_tokens=800):
+def safe_call_gen(client, model_id, prompt, max_new_tokens=2000):
     """Call one model, returning error string instead of raising.
 
     Retries once when the model returns an empty reply (free-tier
