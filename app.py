@@ -1742,6 +1742,11 @@ def kitchen():
                     f"<button class=\"kbtn kbtn-picked\" data-order=\"{html.escape(o['order_number'])}\" "
                     f"data-status=\"picked_up\">{'Delivered' if is_delivery else 'Picked Up'}</button>"
                 )
+            print_url = "/kitchen/print/" + urllib.parse.quote(o["order_number"], safe="")
+            buttons += (
+                f"<a class=\"kbtn kbtn-print\" href=\"{print_url}\" "
+                "target=\"_blank\" rel=\"noopener\">Print</a>"
+            )
             phone_digits = re.sub(r"\D", "", o["customer_phone"])
             delivery_html = ""
             if is_delivery:
@@ -1813,9 +1818,98 @@ def kitchen():
         "  .kbtn { padding: 0.6rem 1.2rem; font-size: 1.05rem; font-weight: 700; border-radius: 8px; border: 1px solid #333; background: #fff; cursor: pointer; margin: 0.3rem 0.3rem 0 0; }\n"
         "  .kbtn-ready { background: #198754; color: #fff; border-color: #198754; }\n"
         "  .kbtn-picked { background: #333; color: #fff; }\n"
-                "  .badge-delivery { background: #cfe2ff; color: #084298; }\n"
+        "  .kbtn-print { background: #fff; color: #1a1a1a; text-decoration: none; display: inline-block; }\n"
+        "  .badge-delivery { background: #cfe2ff; color: #084298; }\n"
         "  .order-card.delivery { border-color: #1a73e8; }\n"
 "</style>\n</head>\n<body>\n" + body + "\n</body>\n</html>\n"
+    )
+
+
+@app.route("/kitchen/print/<order_number>", methods=["GET"])
+def kitchen_print(order_number):
+    """Printable receipt for one of today's orders. Opens in its own page
+    (no 30-second refresh) and brings up the tablet's print dialog, so the
+    kitchen can print the ticket for the order on screen. Same code gate
+    as the kitchen page."""
+    if not KITCHEN_CODE or session.get("kitchen_token") != _kitchen_token():
+        return _kitchen_login_page()
+    orders = get_todays_orders()
+    order = None
+    for o in orders:
+        if o["order_number"] == order_number:
+            order = o
+            break
+    if order is None:
+        return (
+            _order_page_head("Order not found — Vern's Pizza")
+            + "<h1>Order not found</h1>"
+            "<p>That order is not on today's kitchen list any more.</p>"
+            + _order_page_foot()
+        ), 404
+    is_delivery = (order.get("order_type") or "pickup") == "delivery"
+    if order["pickup_type"] == "asap":
+        when = "ASAP (ready ~" + _clock_label(order["pickup_time"]) + ")"
+    else:
+        day = _day_word(order.get("order_date") or "", _calgary_now().strftime("%Y-%m-%d"))
+        when = day + " at " + _clock_label(order["pickup_time"])
+    fulfil_line = "Delivery: " + when if is_delivery else "Pickup: " + when
+    items = "".join(
+        "<li>" + str(ln["quantity"]) + " x " + html.escape(ln["name"])
+        + (" &mdash; " + html.escape(ln["detail"]) if ln["detail"] else "")
+        + " &mdash; " + _money(ln["line_total"]) + "</li>"
+        for ln in order["items"]
+    )
+    phone_digits = re.sub(r"\D", "", order["customer_phone"])
+    address_html = ""
+    if is_delivery:
+        fee = order.get("delivery_fee") or 0.0
+        distance = order.get("delivery_distance_km")
+        distance_html = (" &middot; ~" + format(distance, "g") + " km from the store") if distance is not None else ""
+        address_html = (
+            "<p><strong>DELIVERY</strong><br>" + html.escape(order.get("delivery_address") or "")
+            + distance_html + "</p>"
+        )
+        totals_html = (
+            "<p>Subtotal: " + _money(order["subtotal"]) + "<br>"
+            "Delivery fee: " + _money(fee) + "<br>"
+            "<strong>Total: " + _money(round(order["subtotal"] + fee, 2)) + "</strong><br>"
+            "<span class=\"note\">GST added at the till; pay by card at the door.</span></p>"
+        )
+    else:
+        totals_html = (
+            "<p><strong>Subtotal: " + _money(order["subtotal"]) + "</strong><br>"
+            "<span class=\"note\">GST added at the till.</span></p>"
+        )
+    receipt = (
+        "<h1>Vern&rsquo;s Pizza</h1>"
+        "<p>575 28th Street SE, Calgary &middot; 403-508-0220</p>"
+        "<p class=\"big-number\">" + html.escape(order["order_number"]) + "</p>"
+        "<p><strong>" + html.escape(order["customer_name"]) + "</strong><br>"
+        "<a href=\"tel:" + html.escape(phone_digits) + "\">"
+        + html.escape(order["customer_phone"]) + "</a></p>"
+        + address_html +
+        "<p>" + fulfil_line + "</p>"
+        "<ul>" + items + "</ul>"
+        + totals_html +
+        "<p class=\"note\">Printed " + _calgary_now().strftime("%Y-%m-%d %I:%M %p") + "</p>"
+        "<p class=\"no-print\"><button class=\"big-btn\" onclick=\"window.print()\">Print this order</button></p>"
+    )
+    return (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "<title>Print " + html.escape(order["order_number"]) + " &mdash; Vern&rsquo;s Pizza</title>\n"
+        "<style>\n"
+        "  body { font-family: system-ui, sans-serif; max-width: 72mm; margin: 1rem auto; padding: 0 0.5rem; line-height: 1.5; color: #1a1a1a; }\n"
+        "  h1 { font-size: 1.4rem; margin-bottom: 0; }\n"
+        "  .big-number { font-size: 2.4rem; font-weight: 800; margin: 0.3rem 0; }\n"
+        "  ul { padding-left: 1.2rem; }\n"
+        "  .note { color: #555; font-size: 0.9rem; }\n"
+        "  .big-btn { display: block; width: 100%; padding: 0.9rem; font-size: 1.15rem; font-weight: 700; background: #1a73e8; color: #fff; border: none; border-radius: 8px; cursor: pointer; margin-top: 1rem; }\n"
+        "  @media print { .no-print { display: none; } body { margin: 0; max-width: none; } }\n"
+        "</style>\n</head>\n<body>\n" + receipt +
+        "<script>\n"
+        "window.addEventListener('load', function(){ setTimeout(function(){ window.print(); }, 400); });\n"
+        "</script>\n</body>\n</html>\n"
     )
 
 
